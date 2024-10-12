@@ -372,7 +372,7 @@ def path_inode(path: Path) -> int | None:
         path: Path to the file.
 
     Returns:
-        Inode number or None iff file is not found.
+        Inode number or None if file is not found.
     """
     with suppress(FileNotFoundError):
         return path.stat().st_ino
@@ -414,10 +414,12 @@ class FileCache:
     # Path to index file
     _index_path: Path
 
-    # Current index, not set iff outside context manager
+    # Current index, not set if outside context manager. The index associates
+    # the file's digests with its details and thus ensures that the file can be
+    # quickly retrieved in future requests.
     _index: dict[str, dict[bytes, FileInfo]]
 
-    # Opened index file, not set iff outside context manager
+    # Opened index file, not set if outside context manager
     _index_file: BufferedIOBase
 
     def __init__(self, cachedir: Path) -> None:
@@ -578,8 +580,6 @@ class FileCache:
         If the function succeeds, dest will be a hardlink to the cached file and
         the full information is stored into the index.
 
-        If the function fails, XXX
-
         Args:
             info: Partial information about the file, typically from Release/Packages.
             dest: Destination path.
@@ -590,12 +590,12 @@ class FileCache:
         """
 
         return (
-            self.retrieve_from_index(info, dest)
-            or self.retrieve_from_storage(info, dest)
-            or self.retrieve_from_dest(info, dest)
+            self._retrieve_from_index(info, dest)
+            or self._retrieve_from_storage(info, dest)
+            or self._retrieve_from_dest(info, dest)
         )
 
-    def retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
+    def _retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
         """
         Retrieve a file from the index using its digests.
 
@@ -655,7 +655,22 @@ class FileCache:
         logging.info("Linked file")
         return entry
 
-    def retrieve_from_storage(self, info: FileInfo, dest: Path) -> FileInfo | None:
+    def _retrieve_from_storage(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        Retrieve a file from the cache storage using its digests.
+        This is only useful if the file exists, but is missing from the index.
+
+        This function tries to find a file in the cache storage that matches the primary digest.
+        If the file is found and matches the expected digests, it is linked to the destination
+        path. If the file is missing or corrupted, the function returns None.
+
+        Args:
+            info: Information about the desired file, including its digests.
+            dest: Destination path where the file should be linked to.
+
+        Returns:
+            Full file details from the cache, or None if the file is not found or corrupted.
+        """
         try:
             cpath = self.cache_path(info)
         except KeyError:
@@ -695,7 +710,24 @@ class FileCache:
         logging.info("Linked file")
         return entry
 
-    def retrieve_from_dest(self, info: FileInfo, dest: Path) -> FileInfo | None:
+    def _retrieve_from_dest(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        If a file was found neither in the cache index or the cache storage, check if it
+        was already downloaded, e.g. during a previous (interrupted) run of the program.
+
+        This function checks if a file at the destination path matches the expected digests.
+        If the file is missing or corrupted, the function returns None.
+        Otherwise the function links the destination file into the index or
+        vice versa, and adds it to the index.
+
+        Args:
+            info: Information about the desired file, including its digests.
+            dest: Destination path where the file is expected to be found.
+
+        Returns:
+            Full file details from the destination path, or None if the file is
+            not found or corrupted.
+        """
         try:
             entry = Hasher.hash_file(dest, info.url)
         except FileNotFoundError:
@@ -740,6 +772,12 @@ class FileCache:
         return entry
 
     def add_index(self, entry: FileInfo) -> None:
+        """
+        Add a file entry to the cache index.
+
+        Args:
+            entry: Information about the file to be added to the index.
+        """
         for hfunc, digest in entry.digests.items():
             self._index.setdefault(hfunc, {})[digest] = entry
 
@@ -777,6 +815,13 @@ class Config:
 def url_subpath(url: str, base: str) -> str:
     """
     Return sub part of url relative to base.
+
+    Args:
+        url: The full URL.
+        base: The base URL to compare against.
+
+    Returns:
+        The relative subpath of the URL.
     """
     s_base = urlsplit(base)
     s_url = urlsplit(url)
@@ -796,7 +841,7 @@ def url_subpath(url: str, base: str) -> str:
 
 class Fetcher:
     """
-    Caching HTTP downloader
+    Caching HTTP downloader.
     """
 
     # Requests HTTP session
@@ -818,8 +863,13 @@ class Fetcher:
     timeout: int | None
 
     def __init__(self, config: Config, cache: FileCache) -> None:
-        """ """
+        """
+        Initialize the Fetcher with configuration and cache.
 
+        Args:
+            config: Configuration parameters for the fetcher.
+            cache: FileCache instance to use for caching.
+        """
         self.http = Session()
         self.root_url = config.url.rstrip("/") + "/"
         self.dest = config.dest
@@ -831,30 +881,48 @@ class Fetcher:
         self.dest.mkdir(parents=True, exist_ok=True)
 
     def fetch_uncached(self, *paths: str, max_size: int) -> Path:
+        """
+        Fetch a file without using the cache.
+
+        Args:
+            paths: Path components to fetch.
+            max_size: Maximum size of the file to fetch.
+
+        Returns:
+            Path to the downloaded file.
+        """
         url, dest = self._resolve(paths)
         self._download(url, dest, max_size)
         return dest
 
     def fetch_cached(self, digests: Digests, size: int, *paths: str) -> Path:
+        """
+        Fetch a file using the cache.
+        The downloaded file is verified against all specified digests.
+
+        Args:
+            digests: Digests of the file to fetch.
+            size: Exact size of the file to fetch.
+            paths: Path components to fetch.
+
+        Returns:
+            Path to the downloaded file.
+        """
         if not set(digests) & SECURE_HASH_FUNCS:
             raise ValueError("All given digests are insecure: " + ", ".join(digests))
 
         url, dest = self._resolve(paths)
+        expected = FileInfo(size, digests, url)
 
         # Try to fetch the file from the cache
-        if self.cache.retrieve(FileInfo(size, digests, url), dest):
+        if self.cache.retrieve(expected, dest):
             return dest
 
+        # File was not found in cache, download it.
         info = self._download(url, dest, size)
-        if info.size != size:
-            raise ValueError(f"Size mismatch. downloaded={info.size}, expected={size}")
 
-        for hfunc, digest in digests.items():
-            if info.digests[hfunc] != digest:
-                raise ValueError(
-                    f"Mismatch on {hfunc} digest: "
-                    f"downloaded={info.digests[hfunc].hex()}, expected={digest.hex()}"
-                )
+        if not info.matches(expected):
+            raise ValueError("Downloaded file failed checks.")
 
         self.cache.addfile(info, dest)
         return dest
@@ -935,6 +1003,17 @@ class Fetcher:
 
 
 class PackagesInfo(NamedTuple):
+    """
+    Information about a Packages file in the Debian repository.
+
+    Attributes:
+        size: Size of the Packages file in bytes.
+        ext: Compression extension of the Packages file (e.g., gz, bz2).
+        digests: Dictionary of digests for the Packages file, keyed by hash function name.
+        by_hash: Boolean indicating if the file itself and referenced .deb
+                 packages can be fetched by their hash.
+    """
+
     size: int
     ext: str | None
     digests: dict[str, bytes]
@@ -942,6 +1021,19 @@ class PackagesInfo(NamedTuple):
 
 
 def parse_release_file(lines: Iterable[str]) -> dict[str, PackagesInfo]:
+    """
+    Parse the contents of a Release file to extract Packages file information.
+
+    This function parses the given lines from a Release file, extracting information
+    about the Packages files, including their location, size, compression extension, digests,
+    and whether they can be fetched by hash.
+
+    Args:
+        lines: Iterable of lines from the Release file.
+
+    Returns:
+        Dictionary mapping filenames to PackagesInfo objects, containing details about each Packages file.
+    """
     stanzas = list(split_stanzas(lines))
     if len(stanzas) != 1:
         raise ValueError(f"Release file contains {len(stanzas)} stanzas, expected 1")
@@ -994,8 +1086,9 @@ class FlatMirror:
         self.fetcher = Fetcher(self.config, self.cache)
 
     def init_config(self) -> None:
-        # XXX Filter packages with deny/allow-list?
-        # XXX Add support for custom filter?
+        """
+        Initialize configuration parameters for FlatMirror from command line arguments.
+        """
         parser = ArgumentParser(
             prog="flatmirror",
             description="Mirror program for debian flat repository format.",
@@ -1071,7 +1164,10 @@ class FlatMirror:
 
     def fetch_release(self) -> None:
         """
-        Fetch, validate and parse required InRelease file.
+        Fetch, validate, and parse the required InRelease file from the repository
+        to extract information about the available index files.
+
+        If the optional Release and Release.gpg files are present, it processes them as well.
         """
         inrelease = self.fetcher.fetch_uncached(self.config.path, "InRelease", max_size=1048576)
         inrelease_body = self.verifier.check_inline(inrelease)
@@ -1100,6 +1196,14 @@ class FlatMirror:
         self.packages_files = files
 
     def fetch_packages(self) -> None:
+        """
+        Fetch and process the Packages files for the repository.
+
+        This function downloads and validates the compressed Packages files
+        (e.g., Packages.gz, Packages.bz2). It decompresses these files and parses
+        their contents to extract information about available binary .deb packages,
+        which in turn are downloaded too.
+        """
         for filename, info in self.packages_files.items():
             if not info.ext:
                 # Do not download uncompressed file.
@@ -1143,7 +1247,11 @@ class FlatMirror:
         Download a binary .deb package.
 
         Args:
-            stanza: Stanza from the Packages file
+            stanza: Stanza from the Packages file containing metadata about the package.
+
+        This function checks if the package is included or excluded based on the
+        configuration. If the package is included, it downloads the binary package
+        using its filename and validates its digests.
         """
         name = stanza.get_str("package")
         for pattern in self.config.exclude:
@@ -1173,6 +1281,14 @@ class FlatMirror:
         self.fetcher.fetch_cached(digests, file_size, filename)
 
     def run(self) -> None:
+        """
+        Execute the FlatMirror mirroring process.
+
+        This function orchestrates the entire mirroring process. It initializes the
+        file cache, fetches the release information, and downloads the necessary
+        packages.
+        """
+
         with self.cache:
             self.fetch_release()
             self.fetch_packages()
