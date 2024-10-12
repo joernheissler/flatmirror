@@ -154,6 +154,12 @@ class GpgChecker:
     key: Path
 
     def __init__(self, key: Path) -> None:
+        """
+        Initialize the GpgChecker with the path to the GPG key.
+
+        Args:
+            key: Path to the GPG key file.
+        """
         self.key = key
 
     def check_detached(self, signature: Path, signed: Path) -> None:
@@ -216,6 +222,16 @@ class FileInfo(NamedTuple):
     url: str
 
     def matches(self, expected: Self) -> bool:
+        """
+        Check if the current FileInfo matches the expected FileInfo.
+        Only the expected digests are compared; additional digests in self are ignored.
+
+        Args:
+            expected: The expected FileInfo to compare with.
+
+        Returns:
+            True if matches, False otherwise.
+        """
         result = True
         if self.size != expected.size:
             logging.warning(f"Size mismatch: available={self.size}, expected={expected.size}")
@@ -287,6 +303,13 @@ class Hasher:
             Thread(target=self._thread, args=(name, queue), name=name, daemon=True).start()
 
     def _thread(self, name: str, queue: Queue[bytes]) -> None:
+        """
+        Worker thread to process the hashing.
+
+        Args:
+            name: Name of the hash function.
+            queue: Queue to pass the data to hash.
+        """
         hasher = HASH_FUNCS[name].func()
         while item := queue.get():
             hasher.update(item)
@@ -308,7 +331,13 @@ class Hasher:
 
     def finalize(self, url: str) -> FileInfo:
         """
-        Finalize hashers and return the digests
+        Finalize hashers and return the digests.
+
+        Args:
+            url: URL where the file was downloaded from.
+
+        Returns:
+            A FileInfo object with complete information.
         """
         for queue in self._queues:
             queue.put(b"")
@@ -322,10 +351,11 @@ class Hasher:
         Compute the digests of a file.
 
         Args:
-            path: Path to file
+            path: Path to file.
+            url: URL where the file was downloaded from.
 
         Returns:
-            File digests
+            A FileInfo object with complete information.
         """
         self = cls()
         with path.open("rb") as file:
@@ -335,12 +365,28 @@ class Hasher:
 
 
 def path_inode(path: Path) -> int | None:
+    """
+    Get the inode serial number of a file.
+
+    Args:
+        path: Path to the file.
+
+    Returns:
+        Inode number or None iff file is not found.
+    """
     with suppress(FileNotFoundError):
         return path.stat().st_ino
     return None
 
 
 def path_copy(src: Path, dst: Path) -> None:
+    """
+    Copy a file from src to dst.
+
+    Args:
+        src: Source file path.
+        dst: Destination file path.
+    """
     with src.open("rb") as fsrc, dst.open("wb") as fdst:
         while buf := fsrc.read(1 << 20):
             fdst.write(buf)
@@ -376,8 +422,10 @@ class FileCache:
 
     def __init__(self, cachedir: Path) -> None:
         """
+        Initialize the FileCache.
+
         Args:
-            cachedir: Path to cache
+            cachedir: Path to cache.
         """
         self._cachedir = cachedir
         self._cachedir.mkdir(exist_ok=True)
@@ -390,6 +438,12 @@ class FileCache:
             cbor2.dump((self.CACHE_VERSION, []), fwr)
 
     def __enter__(self) -> Self:
+        """
+        Enter the context manager, lock the index file and read the index.
+
+        Returns:
+            The FileCache instance.
+        """
         assert not hasattr(self, "_index")
 
         index_file = self._index_path.open("r+b")
@@ -450,10 +504,10 @@ class FileCache:
         Compute the path to a cached file.
 
         Args:
-            info: File details
+            info: File details.
 
         Returns:
-            Path to cached file
+            Path to cached file.
         """
         digest = info.digests[self.STORAGE_HASH].hex()
         return self._cachedir / digest[:2] / digest
@@ -463,8 +517,8 @@ class FileCache:
         Add a file to the cache.
 
         Args:
-            info: Verified file details
-            path: Path to file
+            info: Verified file details.
+            path: Path to file.
         """
         # Create directory for file.
         dest = self.cache_path(info)
@@ -542,6 +596,17 @@ class FileCache:
         )
 
     def retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        Retrieve a file from the index using its digests.
+
+        Args:
+            info: Partial information about the file.
+            dest: Destination path.
+
+        Returns:
+            Full file details from the index,
+            None if file not in index or corrupted.
+        """
         for hname, digest in info.digests.items():
             if not HASH_FUNCS[hname].secure:
                 # Don't compare digests that are not collision-resistant.
