@@ -334,6 +334,18 @@ class Hasher:
         return self.finalize(url)
 
 
+def path_inode(path: Path) -> int | None:
+    with suppress(FileNotFoundError):
+        return path.stat().st_ino
+    return None
+
+
+def path_copy(src: Path, dst: Path) -> None:
+    with src.open("rb") as fsrc, dst.open("wb") as fdst:
+        while buf := fsrc.read(1 << 20):
+            fdst.write(buf)
+
+
 class FileCache:
     """
     Cache for downloaded files.
@@ -356,10 +368,10 @@ class FileCache:
     # Path to index file
     _index_path: Path
 
-    # Current index, or None if outside context manager
+    # Current index, not set iff outside context manager
     _index: dict[str, dict[bytes, FileInfo]]
 
-    # Opened index file, or None if outside context manager
+    # Opened index file, not set iff outside context manager
     _index_file: BufferedIOBase
 
     def __init__(self, cachedir: Path) -> None:
@@ -469,9 +481,7 @@ class FileCache:
             if pstat.st_ino != dstat.st_ino:
                 if pstat.st_size != dstat.st_size or Hasher.hash_file(dest, info.url) != info:
                     # There's a file in the cache, but it must be broken. Replace its contents.
-                    with path.open("rb") as fsrc, dest.open("wb") as fdst:
-                        while buf := fsrc.read(1 << 20):
-                            fdst.write(buf)
+                    path_copy(path, dest)
 
                 # The file in the cache is good to use. Remove path and link it.
                 path.unlink()
@@ -525,88 +535,106 @@ class FileCache:
             None if file not in cache or corrupted.
         """
 
+        return (
+            self.retrieve_from_index(info, dest)
+            or self.retrieve_from_storage(info, dest)
+            or self.retrieve_from_dest(info, dest)
+        )
+
+    def retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        for hname, digest in info.digests.items():
+            if not HASH_FUNCS[hname].secure:
+                # Don't compare digests that are not collision-resistant.
+                continue
+
+            with suppress(KeyError):
+                # Both lookups can fail.
+                entry = self._index[hname][digest]
+                break
+        else:
+            # Not found in index.
+            return None
+
+        if not entry.matches(info):
+            # Some digests don't match.
+            return None
+
+        # Desired file was found in the index. Check if the file exists and got the right size.
+        cpath = self.cache_path(entry)
         try:
-            dst_stat = dest.stat()
+            cstat = cpath.stat()
         except FileNotFoundError:
-            dst_inode = None
-        else:
-            dst_inode = dst_stat.st_ino
+            logging.warning(f"Cached file {cpath!s} missing.")
+            return None
 
-        if entry := self.lookup_index(info):
-            # Desired file was found in the index.
+        if cstat.st_size != entry.size:
+            logging.warning(
+                f"Size mismatch in cached file {cpath!s}: "
+                f"actual={cstat.st_size}, index={entry.size}"
+            )
+            return None
 
-            cpath = self.cache_path(entry)
-            try:
-                cstat = cpath.stat()
-            except FileNotFoundError:
-                logging.warning(f"Cached file {cpath!s} missing.")
-                # Continue outside the huge if/else.
-            else:
-                if cstat.st_size == entry.size:
-                    # Success! Found the file in the index and the storage.
+        # Success! Found the correct file in the index and the storage.
 
-                    if not entry.url:
-                        # URL might have been forgotten after someone deleted the index.
-                        entry = FileInfo(entry.size, entry.digests, info.url)
-                        self.add_index(entry)
+        if not entry.url:
+            # URL might have been forgotten after someone deleted the index.
+            entry = FileInfo(entry.size, entry.digests, info.url)
+            self.add_index(entry)
 
-                    # Link the file to the destination.
-                    if dst_inode == cstat.st_ino:
-                        logging.info("File already fetched")
-                    else:
-                        if dst_inode is not None:
-                            dest.unlink()
-                        dest.hardlink_to(cpath)
-                        logging.info("Linked file")
-                    return entry
+        if dst_inode := path_inode(dest):
+            if dst_inode == cstat.st_ino:
+                logging.info("File already fetched")
+                return entry
+            dest.unlink()
+        dest.hardlink_to(cpath)
+        logging.info("Linked file")
+        return entry
 
-                logging.warning(
-                    f"Size mismatch in cached file {cpath!s}: "
-                    f"actual={cstat.st_size}, index={entry.size}"
-                )
-                # Continue outside the huge if/else.
-        else:
-            # Desired file was not found in the index.
-            try:
-                cpath = self.cache_path(info)
-                cstat = cpath.stat()
-                if cstat.st_size != info.size:
-                    logging.warning(
-                        f"Size mismatch in cached file {cpath!s}: "
-                        f"actual={cstat.st_size}, expected={info.size}"
-                    )
-                    raise FileNotFoundError
-                entry = Hasher.hash_file(cpath, info.url)
-            except (KeyError, FileNotFoundError):
-                # Desired file was not found in the cache.
-                # Continue outside the huge if/else.
-                pass
-            else:
-                # Found a file in the cache storage that matches the primary digest.
-                # It's missing from the index, e.g. because the index got deleted or corrupted.
+    def retrieve_from_storage(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        try:
+            cpath = self.cache_path(info)
+        except KeyError:
+            return None
 
-                if entry.matches(info):
-                    # Success! Found the file in the storage, but not the index.
+        try:
+            cstat = cpath.stat()
+        except FileNotFoundError:
+            return None
 
-                    # Add file into index to remedy this.
-                    self.add_index(entry)
+        if cstat.st_size != info.size:
+            logging.warning(
+                f"Size mismatch in cached file {cpath!s}: "
+                f"actual={cstat.st_size}, expected={info.size}"
+            )
+            return None
 
-                    # Link the file to the destination.
-                    if dst_inode == cstat.st_ino:
-                        logging.info("File already fetched")
-                    else:
-                        if dst_inode is not None:
-                            dest.unlink()
-                        dest.hardlink_to(cpath)
-                        logging.info("Linked file")
-                    return entry
+        # Found a file in the cache storage that matches the primary digest.
+        # It's missing from the index, e.g. because the index got deleted or corrupted.
 
-                # Continue outside the huge if/else.
+        entry = Hasher.hash_file(cpath, info.url)
+        if not entry.matches(info):
+            return None
 
+        # Success! Found the file in the storage, but not the index.
+
+        # Add file into index to remedy this.
+        self.add_index(entry)
+
+        # Link the file to the destination.
+        if dst_inode := path_inode(dest):
+            if dst_inode == cstat.st_ino:
+                logging.info("File already fetched")
+                return entry
+            dest.unlink()
+        dest.hardlink_to(cpath)
+        logging.info("Linked file")
+        return entry
+
+    def retrieve_from_dest(self, info: FileInfo, dest: Path) -> FileInfo | None:
         try:
             entry = Hasher.hash_file(dest, info.url)
         except FileNotFoundError:
-            # Desired file was not found in the destination either. Give up.
+            # Desired file was not found in the destination. Give up.
             return None
 
         if not entry.matches(info):
@@ -622,28 +650,28 @@ class FileCache:
             # File is not present in the storage. Link it.
             cpath.parent.mkdir(exist_ok=True)
             cpath.hardlink_to(dest)
-        else:
-            # Found a file in the storage, but not in the index. This might
-            # happen when the request did not specify the digest for the
-            # STORAGE_HASH function and the index was deleted/corrupted.
+            self.add_index(entry)
+            return entry
 
-            if dst_inode != cstat.st_ino:
-                logging.warning("Found a different file in the cache.")
-                cinfo = Hasher.hash_file(cpath, info.url)
-                if not cinfo.matches(entry):
-                    # The cached file is broken. Replace its contents.
-                    with dest.open("rb") as fsrc, cpath.open("wb") as fdst:
-                        while buf := fsrc.read(1 << 20):
-                            fdst.write(buf)
+        # Found a file in storage, but not in the index. Possibly the request did not specify
+        # the digest for the STORAGE_HASH function and the index was deleted/corrupted.
 
-                # The file in the cache is good to use. Remove dest and link it.
-                dest.unlink()
-                dest.hardlink_to(cpath)
-            else:
-                logging.warning("File was already in the cache but not in the index")
+        if path_inode(dest) == cstat.st_ino:
+            logging.warning("File was already in the cache but not in the index")
+            self.add_index(entry)
+            return entry
+
+        logging.warning("Found a different file in the cache.")
+        cinfo = Hasher.hash_file(cpath, info.url)
+        if not cinfo.matches(entry):
+            logging.warning("The cached file is broken. Replacing its contents.")
+            path_copy(dest, cpath)
+
+        # The file in the cache is good to use. Remove dest and link it.
+        dest.unlink()
+        dest.hardlink_to(cpath)
 
         self.add_index(entry)
-
         return entry
 
     def add_index(self, entry: FileInfo) -> None:
