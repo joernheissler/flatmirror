@@ -3,3 +3,14 @@ line-length = 96
 
 [tool.isort]
 profile = "black"
+
+[tool.coverage]
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.run]
+branch = true
+source = [
+    "flatmirror",
+    "tests",
+]

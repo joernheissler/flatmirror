@@ -28,180 +28,6 @@ from urllib.parse import urljoin, urlsplit
 import cbor2
 from requests import HTTPError, Session
 
-
-class Stanza(dict[str, str | tuple[str, list[str]]]):
-    """
-    Represents a Stanza from a Debian control file.
-
-    A Stanza consists of key->value pairs. Each value can be a str
-    or (str, [str, str, ...]). The latter is used for multi-line values.
-    """
-
-    def get_str(self, key: str, default: str | None = None) -> str:
-        """
-        Ensure that val is a single-line str.
-
-        Args:
-            key: Key to lookup.
-            default: If given and key is missing, return the default.
-
-        Returns:
-            Value
-        """
-        if key not in self:
-            if default is not None:
-                return default
-            raise KeyError(key)
-
-        val = self[key]
-        if not isinstance(val, str):
-            raise ValueError(val)
-        return val
-
-    def get_multi(self, key: str) -> tuple[str, list[str]]:
-        """
-        Ensure that val is multi-line.
-
-        Args:
-            key: Key to lookup.
-
-        Returns:
-            Value
-        """
-        val = self[key]
-        if isinstance(val, str):
-            raise ValueError(val)
-        return val
-
-
-# Regular expressions to parse Debian control files.
-RE_STANZA_KEYVAL = re.compile(
-    r"""
-    ^
-    (                   # field name
-        [!"$-,.-9;-~]   # first char excludes comment, hyphen, colon.
-        [!-9;-~]*       # following chars exclude colon.
-    )
-    :                   # colon separates name from value
-    \s*                 # whitespace may surround the value
-    (.*?)               # value
-    \s*                 # whitespace may surround the value
-    $
-""",
-    re.X,
-)
-RE_STANZA_COMMENT = re.compile("r^#")
-RE_STANZA_SEPARATOR = re.compile(r"^\s*$")
-RE_STANZA_FOLD = re.compile(r"^\s+(\S.*?)\s*$")
-
-
-def split_stanzas(lines: Iterable[str]) -> Iterator[Stanza]:
-    """
-    Parse a debian control file into a stream of Stanzas.
-
-    https://www.debian.org/doc/debian-policy/ch-controlfields.html#syntax-of-control-files
-
-    Args:
-        lines: Iterable of lines to parse
-
-    Yields:
-        Stream of Stanzas
-    """
-    cur = Stanza()
-    key: str | None = None
-
-    for lineno, line in enumerate(lines, start=1):
-        if RE_STANZA_SEPARATOR.match(line):
-            if cur:
-                yield cur
-                cur = Stanza()
-                key = None
-        elif RE_STANZA_COMMENT.match(line):
-            pass
-        elif match := RE_STANZA_FOLD.match(line):
-            if key is None:
-                raise ValueError(
-                    f"Line {lineno} begins with whitespace outside a multiline field: {line!r}"
-                )
-            cur_val = cur[key]
-            if isinstance(cur_val, str):
-                # Convert simple field into multi-line field.
-                cur[key] = cur_val, [match.group(1)]
-            else:
-                # Append line to multi-line field.
-                cur_val[1].append(match.group(1))
-        elif match := RE_STANZA_KEYVAL.match(line):
-            key = match.group(1).lower()
-            if key in cur:
-                raise ValueError(f"Duplicate key {key!r} on line {lineno}: {line!r}")
-
-            # Add new simple field
-            cur[key] = match.group(2)
-        else:
-            raise ValueError(f"Cannot parse line {lineno}: {line!r}")
-
-    if cur:
-        # At end of file, return the current Stanza.
-        yield cur
-
-
-class GpgChecker:
-    """
-    Verify GPG signatures with the "gpgv" program.
-    """
-
-    # Path to trusted GPG key
-    key: Path
-
-    def __init__(self, key: Path) -> None:
-        """
-        Initialize the GpgChecker with the path to the GPG key.
-
-        Args:
-            key: Path to the GPG key file.
-        """
-        self.key = key
-
-    def check_detached(self, signature: Path, signed: Path) -> None:
-        """
-        Check a detached GPG signature.
-
-        Args:
-            signature: Path to signature file.
-            signed: Path to signed file.
-
-        Raises:
-            Exception: Signature could not be verified for some reason.
-        """
-        args = ["gpgv", "--keyring", str(self.key), "--", str(signature), str(signed)]
-        try:
-            run(args, check=True)
-        except CalledProcessError as ex:
-            logging.error(f"Signature check failed: {ex.cmd} returned code {ex.returncode}")
-            exit(1)
-
-    def check_inline(self, inline: Path) -> str:
-        """
-        Check an inline GPG signature.
-
-        Args:
-            inline: Path to signed file.
-
-        Returns:
-            Verified contents.
-
-        Raises:
-            Exception: Signature could not be verified for some reason.
-        """
-        args = ["gpgv", "--keyring", str(self.key), "-o", "-", "--", str(inline)]
-        try:
-            proc = run(args, text=True, stdout=PIPE, check=True)
-        except CalledProcessError as ex:
-            logging.error(f"Signature check failed: {ex.cmd} returned code {ex.returncode}")
-            exit(1)
-        return proc.stdout
-
-
 # Algorithm->Digests pairs. Algorithms are lower-case "md5", "sha1", "sha256" or "sha512".
 # Digests are 16, 20, 32 or 64 bytes.
 Digests = dict[str, bytes]
@@ -288,7 +114,7 @@ class Hasher:
     size: int
 
     # Computed digests
-    digests: Digests = {}
+    digests: Digests
 
     # One queue per hash algorithm
     _queues: list[Queue[bytes]]
@@ -298,6 +124,7 @@ class Hasher:
         Initialize hasher instance.
         """
         self.size = 0
+        self.digests = {}
         self._queues = [Queue[bytes](maxsize=1) for __ in HASH_FUNCS]
         for name, queue in zip(HASH_FUNCS, self._queues):
             Thread(target=self._thread, args=(name, queue), name=name, daemon=True).start()
@@ -364,6 +191,251 @@ class Hasher:
         return self.finalize(url)
 
 
+class Stanza(dict[str, str | tuple[str, list[str]]]):
+    """
+    Represents a Stanza from a Debian control file.
+
+    A Stanza consists of key->value pairs. Each value can be a str
+    or (str, [str, str, ...]). The latter is used for multi-line values.
+    """
+
+    def get_str(self, key: str, default: str | None = None) -> str:
+        """
+        Ensure that val is a single-line str.
+
+        Args:
+            key: Key to lookup.
+            default: If given and key is missing, return the default.
+
+        Returns:
+            Value
+        """
+        if key not in self:
+            if default is not None:
+                return default
+            raise KeyError(key)
+
+        val = self[key]
+        if not isinstance(val, str):
+            raise ValueError(val)
+        return val
+
+    def get_multi(self, key: str) -> tuple[str, list[str]]:
+        """
+        Ensure that val is multi-line.
+
+        Args:
+            key: Key to lookup.
+
+        Returns:
+            Value
+        """
+        val = self[key]
+        if isinstance(val, str):
+            raise ValueError(val)
+        return val
+
+
+# Regular expressions to parse Debian control files.
+RE_STANZA_KEYVAL = re.compile(
+    r"""
+    ^
+    (                   # field name
+        [!"$-,.-9;-~]   # first char excludes comment, hyphen, colon.
+        [!-9;-~]*       # following chars exclude colon.
+    )
+    :                   # colon separates name from value
+    \s*                 # whitespace may surround the value
+    (.*?)               # value
+    \s*                 # whitespace may surround the value
+    $
+""",
+    re.X,
+)
+RE_STANZA_COMMENT = re.compile(r"^#")
+RE_STANZA_SEPARATOR = re.compile(r"^\s*$")
+RE_STANZA_FOLD = re.compile(r"^\s+(\S.*?)\s*$")
+
+
+def split_stanzas(lines: Iterable[str]) -> Iterator[Stanza]:
+    """
+    Parse a debian control file into a stream of Stanzas.
+
+    https://www.debian.org/doc/debian-policy/ch-controlfields.html#syntax-of-control-files
+
+    Args:
+        lines: Iterable of lines to parse
+
+    Yields:
+        Stream of Stanzas
+    """
+    cur = Stanza()
+    key: str | None = None
+
+    for lineno, line in enumerate(lines, start=1):
+        if RE_STANZA_SEPARATOR.match(line):
+            if cur:
+                yield cur
+                cur = Stanza()
+                key = None
+        elif RE_STANZA_COMMENT.match(line):
+            pass
+        elif match := RE_STANZA_FOLD.match(line):
+            if key is None:
+                raise ValueError(
+                    f"Line {lineno} begins with whitespace outside a multiline field: {line!r}"
+                )
+            cur_val = cur[key]
+            if isinstance(cur_val, str):
+                # Convert simple field into multi-line field.
+                cur[key] = cur_val, [match.group(1)]
+            else:
+                # Append line to multi-line field.
+                cur_val[1].append(match.group(1))
+        elif match := RE_STANZA_KEYVAL.match(line):
+            key = match.group(1).lower()
+            if key in cur:
+                raise ValueError(f"Duplicate key {key!r} on line {lineno}: {line!r}")
+
+            # Add new simple field
+            cur[key] = match.group(2)
+        else:
+            raise ValueError(f"Cannot parse line {lineno}: {line!r}")
+
+    if cur:
+        # At end of file, return the current Stanza.
+        yield cur
+
+
+class PackagesInfo(NamedTuple):
+    """
+    Information about a Packages file in the Debian repository.
+
+    Attributes:
+        size: Size of the Packages file in bytes.
+        ext: Compression extension of the Packages file (e.g., gz, bz2).
+        digests: Dictionary of digests for the Packages file, keyed by hash function name.
+        by_hash: Boolean indicating if the file itself and referenced .deb
+                 packages can be fetched by their hash.
+    """
+
+    size: int
+    ext: str | None
+    digests: dict[str, bytes]
+    by_hash: bool
+
+
+def parse_release_file(lines: Iterable[str]) -> dict[str, PackagesInfo]:
+    """
+    Parse the contents of a Release file to extract Packages file information.
+
+    This function parses the given lines from a Release file, extracting information
+    about the Packages files, including their location, size, compression extension, digests,
+    and whether they can be fetched by hash.
+
+    Args:
+        lines: Iterable of lines from the Release file.
+
+    Returns:
+        Dictionary mapping filenames to PackagesInfo objects, containing details about each Packages file.
+    """
+    stanzas = list(split_stanzas(lines))
+    if len(stanzas) != 1:
+        raise ValueError(f"Release file contains {len(stanzas)} stanzas, expected 1")
+
+    release = stanzas[0]
+    by_hash = release.get_str("acquire-by-hash", "no") == "yes"
+    files: dict[str, PackagesInfo] = {}
+    for hfunc in HASH_FUNCS.values():
+        if hfunc.debian_name.lower() not in release:
+            continue
+
+        firstline, digests = release.get_multi(hfunc.debian_name.lower())
+        if firstline:
+            raise ValueError(firstline)
+
+        for line in digests:
+            hdigest, size, filename = line.split()
+            digest = bytes.fromhex(hdigest)
+            if not (match := re.match(r"(?:^|.*/)Packages(?:\.(xz|gz|bz2|lzma))?$", filename)):
+                continue
+            if filename not in files:
+                files[filename] = PackagesInfo(
+                    int(size), match.group(1), {hfunc.name: digest}, by_hash
+                )
+                continue
+            if files[filename].size != int(size):
+                raise ValueError(size)
+            files[filename].digests[hfunc.name] = digest
+
+    return files
+
+
+class SignatureError(Exception):
+    """
+    Bad GPG signature.
+    """
+
+
+class GpgChecker:
+    """
+    Verify GPG signatures with the "gpgv" program.
+    """
+
+    # Path to trusted GPG key
+    key: Path
+
+    def __init__(self, key: Path) -> None:
+        """
+        Initialize the GpgChecker with the path to the GPG key.
+
+        Args:
+            key: Path to the GPG key file.
+        """
+        self.key = key
+
+    def check_detached(self, signature: Path, signed: Path) -> None:
+        """
+        Check a detached GPG signature.
+
+        Args:
+            signature: Path to signature file.
+            signed: Path to signed file.
+
+        Raises:
+            Exception: Signature could not be verified for some reason.
+        """
+        args = ["gpgv", "--keyring", str(self.key), "--", str(signature), str(signed)]
+        try:
+            run(args, check=True)
+        except CalledProcessError as ex:
+            raise SignatureError(
+                f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
+            )
+
+    def check_inline(self, inline: Path) -> str:
+        """
+        Check an inline GPG signature.
+
+        Args:
+            inline: Path to signed file.
+
+        Returns:
+            Verified contents.
+
+        Raises:
+            Exception: Signature could not be verified for some reason.
+        """
+        args = ["gpgv", "--keyring", str(self.key), "-o", "-", "--", str(inline)]
+        try:
+            proc = run(args, text=True, stdout=PIPE, check=True)
+        except CalledProcessError as ex:
+            raise SignatureError(
+                f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
+            )
+        return proc.stdout
+
+
 def path_inode(path: Path) -> int | None:
     """
     Get the inode serial number of a file.
@@ -394,9 +466,18 @@ def path_copy(src: Path, dst: Path) -> None:
 
 class FileCache:
     """
-    Cache for downloaded files.
+    Efficient cache for downloaded files.
 
-    Files are referenced by their check sum and are hard linked to the proper locations.
+    Files are referenced by their cryptographic hashsums (digests) and are hard
+    linked instead of copied.
+
+    The code handles lots of edge cases to ensure correct results while
+    avoiding re-downloading or re-hashing files.
+
+    In particular one edge-case is not handled for reasons of efficiency: If a
+    cached file is corrupted without changing its size, this won't be detected.
+    Only way around this would be to re-hash the file every time it is
+    retrieved from the cache. The cleanup function will detect those corruptions.
     """
 
     # Version number of the current cache format
@@ -465,7 +546,8 @@ class FileCache:
             for item in cache:
                 info = FileInfo(*item)
                 for hfunc, digest in info.digests.items():
-                    index.setdefault(hfunc, {})[digest] = info
+                    if hfunc in SECURE_HASH_FUNCS:
+                        index.setdefault(hfunc, {})[digest] = info
 
         except Exception:
             # Close index in case of error
@@ -501,77 +583,47 @@ class FileCache:
         # Close old index file.
         old_fp.close()
 
-    def cache_path(self, info: FileInfo) -> Path:
-        """
-        Compute the path to a cached file.
-
-        Args:
-            info: File details.
-
-        Returns:
-            Path to cached file.
-        """
-        digest = info.digests[self.STORAGE_HASH].hex()
-        return self._cachedir / digest[:2] / digest
-
-    def addfile(self, info: FileInfo, path: Path) -> None:
+    def addfile(self, new_info: FileInfo, new_path: Path) -> None:
         """
         Add a file to the cache.
 
         Args:
-            info: Verified file details.
-            path: Path to file.
+            new_info: Verified file details.
+            new_path: Path to file.
         """
         # Create directory for file.
-        dest = self.cache_path(info)
-        dest.parent.mkdir(exist_ok=True)
+        cached_path = self._cache_path(new_info)
+        cached_path.parent.mkdir(exist_ok=True)
 
         # Link file into cache dir.
         try:
-            dstat = dest.stat()
+            cached_stat = cached_path.stat()
         except FileNotFoundError:
-            # Hardlink path into cache
-            dest.hardlink_to(path)
+            # Hardlink new_path into cache
+            cached_path.hardlink_to(new_path)
         else:
-            pstat = path.stat()
-            if pstat.st_ino != dstat.st_ino:
-                if pstat.st_size != dstat.st_size or Hasher.hash_file(dest, info.url) != info:
+            new_stat = new_path.stat()
+            if new_stat.st_ino != cached_stat.st_ino:
+                cached_info = Hasher.hash_file(cached_path, new_info.url)
+                if cached_info.digests[self.STORAGE_HASH] != new_info.digests[self.STORAGE_HASH]:
                     # There's a file in the cache, but it must be broken. Replace its contents.
-                    path_copy(path, dest)
+                    path_copy(new_path, cached_path)
+                    # The file in the cache is good to use. Remove new_path and link it.
+                    new_path.unlink()
+                    new_path.hardlink_to(cached_path)
+                elif cached_info != new_info:
+                    raise SystemError(f"Internal error or hash collision in a secure hash function: "
+                                      f"{cached_info=}, {cached_path=}, {new_info}, {new_path=}")
 
-                # The file in the cache is good to use. Remove path and link it.
-                path.unlink()
-                path.hardlink_to(dest)
+                # The file in the cache is good to use. Remove new_path and link it.
+                new_path.unlink()
+                new_path.hardlink_to(cached_path)
             else:
                 # Downloaded file and cached file are the same. Do nothing.
                 pass
 
         # Add file to index.
-        self.add_index(info)
-
-    def lookup_index(self, info: FileInfo) -> FileInfo | None:
-        """
-        Lookup cache entry by digest.
-
-        Args:
-            info: Information about the desired file.
-
-        Returns:
-            Full information from the index or None if not found or something did not match.
-        """
-        for hname, digest in info.digests.items():
-            if not HASH_FUNCS[hname].secure:
-                # Don't compare digests that are not collision-resistant.
-                continue
-
-            with suppress(KeyError):
-                # Both lookups can fail.
-                entry = self._index[hname][digest]
-                break
-        else:
-            return None
-
-        return entry if entry.matches(info) else None
+        self._add_index(new_info)
 
     def retrieve(self, info: FileInfo, dest: Path) -> FileInfo | None:
         """
@@ -595,6 +647,31 @@ class FileCache:
             or self._retrieve_from_dest(info, dest)
         )
 
+    def cleanup(self) -> None:
+        """
+        Maintainance tasks
+
+        * Give details about everything, with varying debug level
+        * Remove all unused files from the cache.
+        * Add used files to the index.
+        * Fixup the index.
+        * Recalculate all hashes and complain on errors.
+        * Detect any hash collisons
+        """
+
+    def _cache_path(self, info: FileInfo) -> Path:
+        """
+        Compute the path to a cached file.
+
+        Args:
+            info: File details.
+
+        Returns:
+            Path to cached file.
+        """
+        digest = info.digests[self.STORAGE_HASH].hex()
+        return self._cachedir / digest[:2] / digest
+
     def _retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
         """
         Retrieve a file from the index using its digests.
@@ -608,7 +685,7 @@ class FileCache:
             None if file not in index or corrupted.
         """
         for hname, digest in info.digests.items():
-            if not HASH_FUNCS[hname].secure:
+            if not hname in SECURE_HASH_FUNCS:
                 # Don't compare digests that are not collision-resistant.
                 continue
 
@@ -625,7 +702,7 @@ class FileCache:
             return None
 
         # Desired file was found in the index. Check if the file exists and got the right size.
-        cpath = self.cache_path(entry)
+        cpath = self._cache_path(entry)
         try:
             cstat = cpath.stat()
         except FileNotFoundError:
@@ -644,7 +721,7 @@ class FileCache:
         if not entry.url:
             # URL might have been forgotten after someone deleted the index.
             entry = FileInfo(entry.size, entry.digests, info.url)
-            self.add_index(entry)
+            self._add_index(entry)
 
         if dst_inode := path_inode(dest):
             if dst_inode == cstat.st_ino:
@@ -672,7 +749,7 @@ class FileCache:
             Full file details from the cache, or None if the file is not found or corrupted.
         """
         try:
-            cpath = self.cache_path(info)
+            cpath = self._cache_path(info)
         except KeyError:
             return None
 
@@ -698,7 +775,7 @@ class FileCache:
         # Success! Found the file in the storage, but not the index.
 
         # Add file into index to remedy this.
-        self.add_index(entry)
+        self._add_index(entry)
 
         # Link the file to the destination.
         if dst_inode := path_inode(dest):
@@ -738,16 +815,16 @@ class FileCache:
             # Found some file, but it's not what we want. Give up.
             return None
 
-        # Success! File was already downloaded, but it's not in the index yet.
+        # Success! File was already downloaded, but it's not in the index or missing in cache.
 
-        cpath = self.cache_path(entry)
+        cpath = self._cache_path(entry)
         try:
             cstat = cpath.stat()
         except FileNotFoundError:
             # File is not present in the storage. Link it.
             cpath.parent.mkdir(exist_ok=True)
             cpath.hardlink_to(dest)
-            self.add_index(entry)
+            self._add_index(entry)
             return entry
 
         # Found a file in storage, but not in the index. Possibly the request did not specify
@@ -755,7 +832,7 @@ class FileCache:
 
         if path_inode(dest) == cstat.st_ino:
             logging.warning("File was already in the cache but not in the index")
-            self.add_index(entry)
+            self._add_index(entry)
             return entry
 
         logging.warning("Found a different file in the cache.")
@@ -768,10 +845,10 @@ class FileCache:
         dest.unlink()
         dest.hardlink_to(cpath)
 
-        self.add_index(entry)
+        self._add_index(entry)
         return entry
 
-    def add_index(self, entry: FileInfo) -> None:
+    def _add_index(self, entry: FileInfo) -> None:
         """
         Add a file entry to the cache index.
 
@@ -779,17 +856,8 @@ class FileCache:
             entry: Information about the file to be added to the index.
         """
         for hfunc, digest in entry.digests.items():
-            self._index.setdefault(hfunc, {})[digest] = entry
-
-    def cleanup(self) -> None:
-        """
-        Maintainance tasks
-
-        * Remove all unused files from the cache.
-        * Remove entries from the index if the file is missing.
-        * Add new files to the index.
-        * Recalculate all hashes and complain on errors.
-        """
+            if hfunc in SECURE_HASH_FUNCS:
+                self._index.setdefault(hfunc, {})[digest] = entry
 
 
 @dataclass
@@ -1000,70 +1068,6 @@ class Fetcher:
             f"speed={hasher.size / total_time / 1024:.0f} KiB/s"
         )
         return hasher.finalize(url)
-
-
-class PackagesInfo(NamedTuple):
-    """
-    Information about a Packages file in the Debian repository.
-
-    Attributes:
-        size: Size of the Packages file in bytes.
-        ext: Compression extension of the Packages file (e.g., gz, bz2).
-        digests: Dictionary of digests for the Packages file, keyed by hash function name.
-        by_hash: Boolean indicating if the file itself and referenced .deb
-                 packages can be fetched by their hash.
-    """
-
-    size: int
-    ext: str | None
-    digests: dict[str, bytes]
-    by_hash: bool
-
-
-def parse_release_file(lines: Iterable[str]) -> dict[str, PackagesInfo]:
-    """
-    Parse the contents of a Release file to extract Packages file information.
-
-    This function parses the given lines from a Release file, extracting information
-    about the Packages files, including their location, size, compression extension, digests,
-    and whether they can be fetched by hash.
-
-    Args:
-        lines: Iterable of lines from the Release file.
-
-    Returns:
-        Dictionary mapping filenames to PackagesInfo objects, containing details about each Packages file.
-    """
-    stanzas = list(split_stanzas(lines))
-    if len(stanzas) != 1:
-        raise ValueError(f"Release file contains {len(stanzas)} stanzas, expected 1")
-
-    release = stanzas[0]
-    by_hash = release.get_str("acquire-by-hash", "no") == "yes"
-    files: dict[str, PackagesInfo] = {}
-    for hfunc in HASH_FUNCS.values():
-        if hfunc.debian_name.lower() not in release:
-            continue
-
-        firstline, digests = release.get_multi(hfunc.debian_name.lower())
-        if firstline:
-            raise ValueError(firstline)
-
-        for line in digests:
-            hdigest, size, filename = line.split()
-            digest = bytes.fromhex(hdigest)
-            if not (match := re.match(r"(?:^|/)Packages(?:\.(xz|gz|bz2|lzma))?$", filename)):
-                continue
-            if filename not in files:
-                files[filename] = PackagesInfo(
-                    int(size), match.group(1), {hfunc.name: digest}, by_hash
-                )
-                continue
-            if files[filename].size != int(size):
-                raise ValueError(size)
-            files[filename].digests[hfunc.name] = digest
-
-    return files
 
 
 class FlatMirror:
