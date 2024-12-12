@@ -12,7 +12,7 @@ create the signatures for the tests and any member of the public is welcome to d
 
 @pytest.fixture
 def datadir() -> Path:
-    return Path(__file__).parent / "data"
+    return Path(__file__).parent / "data" / "gpg"
 
 
 @pytest.fixture
@@ -21,15 +21,15 @@ def gpg_checker(datadir: Path) -> flatmirror.GpgChecker:
 
 
 def test_detached(gpg_checker: flatmirror.GpgChecker, datadir: Path) -> None:
-    gpg_checker.check_detached(datadir / "gpg-test.txt.gpg", datadir / "gpg-test.txt")
+    gpg_checker.check_detached(datadir / "good-detached.gpg", datadir / "plain.txt")
 
     with pytest.raises(flatmirror.SignatureError):
-        gpg_checker.check_detached(datadir / "gpg-bad.txt.gpg", datadir / "gpg-test.txt")
+        gpg_checker.check_detached(datadir / "bad-detached.gpg", datadir / "plain.txt")
 
 
 def test_inline(gpg_checker: flatmirror.GpgChecker, datadir: Path) -> None:
-    value = gpg_checker.check_inline(datadir / "gpg-test.txt.asc")
-    assert value == (datadir / "gpg-test.txt").read_text()
+    value = gpg_checker.check_inline(datadir / "good-inline.asc")
+    assert value == (datadir / "plain.txt").read_text()
 
     with pytest.raises(flatmirror.SignatureError):
-        gpg_checker.check_inline(datadir / "gpg-bad.txt.asc")
+        gpg_checker.check_inline(datadir / "bad-inline.asc")

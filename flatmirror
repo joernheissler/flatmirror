@@ -12,7 +12,7 @@ import logging
 import lzma
 import re
 from argparse import ArgumentParser
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from io import BufferedIOBase
@@ -337,7 +337,8 @@ def parse_release_file(lines: Iterable[str]) -> dict[str, PackagesInfo]:
         lines: Iterable of lines from the Release file.
 
     Returns:
-        Dictionary mapping filenames to PackagesInfo objects, containing details about each Packages file.
+        Dictionary mapping filenames to PackagesInfo objects, containing details about each
+        Packages file.
     """
     stanzas = list(split_stanzas(lines))
     if len(stanzas) != 1:
@@ -411,7 +412,7 @@ class GpgChecker:
         except CalledProcessError as ex:
             raise SignatureError(
                 f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
-            )
+            ) from ex
 
     def check_inline(self, inline: Path) -> str:
         """
@@ -432,7 +433,7 @@ class GpgChecker:
         except CalledProcessError as ex:
             raise SignatureError(
                 f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
-            )
+            ) from ex
         return proc.stdout
 
 
@@ -605,15 +606,21 @@ class FileCache:
             new_stat = new_path.stat()
             if new_stat.st_ino != cached_stat.st_ino:
                 cached_info = Hasher.hash_file(cached_path, new_info.url)
-                if cached_info.digests[self.STORAGE_HASH] != new_info.digests[self.STORAGE_HASH]:
+                if (
+                    cached_info.digests[self.STORAGE_HASH]
+                    != new_info.digests[self.STORAGE_HASH]
+                ):
                     # There's a file in the cache, but it must be broken. Replace its contents.
                     path_copy(new_path, cached_path)
                     # The file in the cache is good to use. Remove new_path and link it.
                     new_path.unlink()
                     new_path.hardlink_to(cached_path)
                 elif cached_info != new_info:
-                    raise SystemError(f"Internal error or hash collision in a secure hash function: "
-                                      f"{cached_info=}, {cached_path=}, {new_info}, {new_path=}")
+                    raise SystemError(
+                        f"Internal error or hash collision in a secure hash "
+                        f"function: {cached_info=}, {cached_path=}, "
+                        f"{new_info}, {new_path=}"
+                    )
 
                 # The file in the cache is good to use. Remove new_path and link it.
                 new_path.unlink()
@@ -879,6 +886,84 @@ class Config:
     exclude: list[re.Pattern[str]]
     include: list[re.Pattern[str]]
 
+    @classmethod
+    def from_cmdline(cls, argv: Sequence[str] | None = None) -> Self:
+        """
+        Initialize configuration parameters for FlatMirror from command line arguments.
+        """
+        parser = ArgumentParser(
+            prog="flatmirror",
+            description="Mirror program for debian flat repository format.",
+        )
+        parser.add_argument(
+            "--gpgkey",
+            required=True,
+            type=Path,
+            help="Path to gpg key that signs this repo.",
+        )
+        parser.add_argument("--url", required=True, help="URL to remote server.")
+        parser.add_argument("--path", required=True, help="Path on remote server.")
+        parser.add_argument(
+            "--cache",
+            required=True,
+            type=Path,
+            help="Path to cache directory, must be on same file system as dest.",
+        )
+        parser.add_argument(
+            "--dest", required=True, type=Path, help="Destination path to mirror into."
+        )
+        parser.add_argument(
+            "--arch",
+            required=True,
+            action="append",
+            help="Architecture(s) to mirror. Specify multiple times for multiple archs.",
+        )
+        parser.add_argument(
+            "--timeout",
+            required=False,
+            type=int,
+            default=30,
+            help="Timeout in seconds before download aborts. 0 disables timeout.",
+        )
+        parser.add_argument(
+            "--minspeed",
+            required=False,
+            type=int,
+            default=1,
+            help="Minimum speed in KiB/second. Download aborts if speed is below this.",
+        )
+        parser.add_argument(
+            "--exclude",
+            required=False,
+            action="append",
+            default=[],
+            help="Packages to exclude from mirroring (regex). "
+            "Specify multiple times for multiple exclusions.",
+        )
+        parser.add_argument(
+            "--include",
+            required=False,
+            action="append",
+            default=[],
+            help="Packages to include (regex). Specify multiple times for multiple inclusions. "
+            "By default, all packages are mirrored.",
+        )
+
+        args = parser.parse_args(argv)
+
+        return cls(
+            gpgkey=args.gpgkey.expanduser(),
+            url=args.url,
+            path=args.path.rstrip("/"),
+            cache=args.cache.expanduser().resolve(),
+            dest=args.dest.expanduser().resolve(),
+            arch=set(args.arch),
+            timeout=args.timeout or None,
+            min_speed=args.minspeed,
+            exclude=[re.compile(pattern) for pattern in args.exclude],
+            include=[re.compile(pattern) for pattern in args.include],
+        )
+
 
 def url_subpath(url: str, base: str) -> str:
     """
@@ -1035,16 +1120,17 @@ class Fetcher:
         Returns:
             Details about downloaded file.
         """
-        # XXX log current speed?
-
         hasher = Hasher()
         logging.info(f"Downloading file: {url=!s}, {dest=!s}, {max_size=}")
         start_time = time()
+        speedlog_time = -10
         with self.http.get(url, stream=True, timeout=self.timeout) as resp:
             resp.raise_for_status()
             first_data_time = None
             with dest.open("wb") as fwr:
-                for body in resp.iter_content(chunk_size=None):
+
+                # XXX chunk_size should be None, but see https://github.com/psf/requests/issues/5536
+                for body in resp.iter_content(chunk_size=65536):
                     if len(body) + hasher.size > max_size:
                         raise ValueError(f"Maximum size {max_size} exceeded.")
                     fwr.write(body)
@@ -1054,6 +1140,12 @@ class Fetcher:
                         first_data_time = cur_time
                     else:
                         cur_speed = hasher.size / (cur_time - first_data_time) / 1024
+                        if cur_time - speedlog_time >= 5:
+                            logging.info(
+                                f"Fetched {hasher.size} bytes. Speed: {cur_speed:.1f} KiB/s"
+                            )
+                            speedlog_time = cur_time
+
                         if cur_speed < self.min_speed:
                             raise TimeoutError(
                                 "Below minimum speed: "
@@ -1083,88 +1175,11 @@ class FlatMirror:
     # File cache
     cache: FileCache
 
-    def __init__(self) -> None:
-        self.init_config()
+    def __init__(self, argv: Sequence[str] | None = None) -> None:
+        self.config = Config.from_cmdline(argv)
         self.verifier = GpgChecker(self.config.gpgkey.resolve())
         self.cache = FileCache(self.config.cache)
         self.fetcher = Fetcher(self.config, self.cache)
-
-    def init_config(self) -> None:
-        """
-        Initialize configuration parameters for FlatMirror from command line arguments.
-        """
-        parser = ArgumentParser(
-            prog="flatmirror",
-            description="Mirror program for debian flat repository format.",
-        )
-        parser.add_argument(
-            "--gpgkey",
-            required=True,
-            type=Path,
-            help="Path to gpg key that signs this repo.",
-        )
-        parser.add_argument("--url", required=True, help="URL to remote server.")
-        parser.add_argument("--path", required=True, help="Path on remote server.")
-        parser.add_argument(
-            "--cache",
-            required=True,
-            type=Path,
-            help="Path to cache directory, must be on same file system as dest.",
-        )
-        parser.add_argument(
-            "--dest", required=True, type=Path, help="Destination path to mirror into."
-        )
-        parser.add_argument(
-            "--arch",
-            required=True,
-            action="append",
-            help="Architecture(s) to mirror. Specify multiple times for multiple archs.",
-        )
-        parser.add_argument(
-            "--timeout",
-            required=False,
-            type=int,
-            default=30,
-            help="Timeout in seconds before download aborts. 0 disables timeout.",
-        )
-        parser.add_argument(
-            "--minspeed",
-            required=False,
-            type=int,
-            default=1,
-            help="Minimum speed in KiB/second. Download aborts if speed is below this.",
-        )
-        parser.add_argument(
-            "--exclude",
-            required=False,
-            action="append",
-            default=[],
-            help="Packages to exclude from mirroring (regex). "
-            "Specify multiple times for multiple exclusions.",
-        )
-        parser.add_argument(
-            "--include",
-            required=False,
-            action="append",
-            default=[],
-            help="Packages to include (regex). Specify multiple times for multiple inclusions. "
-            "By default, all packages are mirrored.",
-        )
-
-        args = parser.parse_args()
-
-        self.config = Config(
-            gpgkey=args.gpgkey.expanduser(),
-            url=args.url,
-            path=args.path.rstrip("/"),
-            cache=args.cache.expanduser().resolve(),
-            dest=args.dest.expanduser().resolve(),
-            arch=set(args.arch),
-            timeout=args.timeout or None,
-            min_speed=args.minspeed,
-            exclude=[re.compile(pattern) for pattern in args.exclude],
-            include=[re.compile(pattern) for pattern in args.include],
-        )
 
     def fetch_release(self) -> None:
         """

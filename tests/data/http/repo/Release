@@ -1,0 +1,13 @@
+Codename: tests
+Architectures: z80
+Date: Tue Dec 12 07:38:01 2024
+Description: flatmirror test repo
+MD5Sum:
+ 99b964abca8fcb4f63706ffd09cf02ac 44194 Packages
+ 71dc0a88e46e2729b5204b235d362b2b 8514 Packages.gz
+SHA1:
+ 6a3cd40373caac39aab17b0c2cea60c9a208c641 44194 Packages
+ 591ac28caca08cad0f135983234fcfbdb9616fa3 8514 Packages.gz
+SHA256:
+ 9d7050783c0d066d2e85477fb768be865062647a2164a2711daba813eb325a83 44194 Packages
+ 88bfa461e0823ab4da44e828c70d7f90fc8f24d3251fd1eae9884321866590d6 8514 Packages.gz

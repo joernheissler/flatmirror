@@ -1,6 +1,6 @@
 import pytest
 
-from . import fileinfos, flatmirror
+from . import flatmirror
 from .fileinfos import fileinfo_bad, fileinfo_partial, fileinfo_prng
 
 
@@ -13,6 +13,8 @@ def test_fileinfo_partial(
         fileinfo_partial.matches(fileinfo_prng)
 
 
-def test_fileinfo_bad(fileinfo_prng: flatmirror.FileInfo, fileinfo_bad: flatmirror.FileInfo) -> None:
+def test_fileinfo_bad(
+    fileinfo_prng: flatmirror.FileInfo, fileinfo_bad: flatmirror.FileInfo
+) -> None:
 
     assert not fileinfo_prng.matches(fileinfo_bad)
