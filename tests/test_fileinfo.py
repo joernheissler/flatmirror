@@ -1,7 +1,6 @@
 import pytest
 
 from . import flatmirror
-from .fileinfos import fileinfo_bad, fileinfo_partial, fileinfo_prng
 
 
 def test_fileinfo_partial(

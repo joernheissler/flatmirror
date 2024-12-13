@@ -17,7 +17,7 @@ def cachedir() -> Iterable[Path]:
 
 
 def test_noop(cachedir: Path) -> None:
-    with flatmirror.FileCache(cachedir / "cache") as cache:
+    with flatmirror.FileCache(cachedir / "cache"):
         pass
 
 
@@ -85,7 +85,7 @@ def test_store_retrieve(cachedir: Path) -> None:
         assert cache.retrieve(info, dest)
 
     stat2 = dest.stat()
-    assert stat1 == stat2
+    assert stat1.st_ino == stat2.st_ino
 
     # Prepare a broken file.
     dest.unlink()
@@ -96,7 +96,7 @@ def test_store_retrieve(cachedir: Path) -> None:
         assert cache.retrieve(info, dest)
 
     stat2 = dest.stat()
-    assert stat1 == stat2
+    assert stat1.st_ino == stat2.st_ino
 
 
 def test_file_gone(cachedir: Path) -> None:

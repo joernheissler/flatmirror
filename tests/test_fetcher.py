@@ -1,7 +1,6 @@
 from collections.abc import Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import sleep
 
 import pytest
 from requests import ConnectTimeout, HTTPError, ReadTimeout
@@ -75,26 +74,27 @@ def test_download(mock: MockAdapter, fetcher: flatmirror.Fetcher) -> None:
 
 def test_fetch_uncached(mock: MockAdapter, fetcher: flatmirror.Fetcher) -> None:
     with mock(3, 1, 4096):
-        fetcher.fetch_uncached("README", max_size=5000)
+        fetcher.fetch_uncached("deb/dummy-z80.deb", max_size=5000)
         with pytest.raises(HTTPError):
             fetcher.fetch_uncached("missing", max_size=123)
 
 
 def test_fetch_cached(mock: MockAdapter, fetcher: flatmirror.Fetcher) -> None:
     digests = {
-        "md5": bytes.fromhex("ae272b9712bed73add345859b4fe5d61"),
+        "md5": bytes.fromhex("381628e82aaa39a064009e21f65714fa"),
         "sha256": bytes.fromhex(
-            "63304d707a7c1761e3ace8e6309e51225b9a42b18436b4c3968cbe86c0373da2"
+            "6dfbd08c96b6a517482692945b8587f71b90750a4ecb16c522ef7b1caeb19350"
         ),
     }
+    size = 30
     with mock(1, 1, 4096):
         with pytest.raises(ValueError):
-            fetcher.fetch_cached({"md5": digests["md5"]}, 22, "deb/dummy.deb")
+            fetcher.fetch_cached({"md5": digests["md5"]}, size, "deb/dummy-z80.deb")
 
-        fetcher.fetch_cached(digests, 22, "deb/dummy.deb")
+        fetcher.fetch_cached(digests, size, "deb/dummy-z80.deb")
 
         # Download again, from cache.
-        fetcher.fetch_cached(digests, 22, "deb/dummy.deb")
+        fetcher.fetch_cached(digests, size, "deb/dummy-z80.deb")
 
         with pytest.raises(ValueError):
-            fetcher.fetch_cached({**digests, "sha1": bytes(20)}, 22, "deb/dummy.deb")
+            fetcher.fetch_cached({**digests, "sha1": bytes(20)}, size, "deb/dummy-z80.deb")

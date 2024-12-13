@@ -2,21 +2,18 @@ import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from io import BytesIO
-from math import inf
 from os import urandom
 from pathlib import Path
-from time import sleep
 from typing import IO, Any, Self
 from urllib.parse import urlsplit
 
-import pytest
 from freezegun import freeze_time
 from freezegun.api import (
     FrozenDateTimeFactory,
     StepTickTimeFactory,
     TickingDateTimeFactory,
 )
-from requests import ConnectTimeout, PreparedRequest, ReadTimeout, Response, Session
+from requests import ConnectTimeout, PreparedRequest, ReadTimeout, Response
 from requests.adapters import BaseAdapter
 
 urllib.parse.uses_relative.append("mock")
@@ -56,6 +53,9 @@ class MockAdapter(BaseAdapter):
 
         resp = Response()
 
+        assert request.url
+        resp.url = request.url
+
         req_path = urlsplit(request.url).path
         assert isinstance(req_path, str)
         assert req_path.startswith(self.prefix)
@@ -65,12 +65,15 @@ class MockAdapter(BaseAdapter):
         if self.random is not None:
             fp = BytesIO(urandom(self.random))
             resp.status_code = 200
+            resp.reason = "OK"
         elif not path.is_file():
             fp = BytesIO(b"Not found")
             resp.status_code = 404
+            resp.reason = "Not found"
         else:
             fp = path.open("rb")
             resp.status_code = 200
+            resp.reason = "OK"
 
         resp.raw = StreamReader(self, fp, read_tmout)
         return resp

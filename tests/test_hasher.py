@@ -4,7 +4,6 @@ from random import randrange
 from tempfile import NamedTemporaryFile
 
 from . import flatmirror
-from .fileinfos import fileinfo_empty, fileinfo_prng
 
 
 class PseudoRandom:

@@ -11,6 +11,6 @@ show_missing = true
 [tool.coverage.run]
 branch = true
 source = [
-    "flatmirror",
+    "tests.flatmirror",
     "tests",
 ]

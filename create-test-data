@@ -1,0 +1,148 @@
+#!/bin/bash
+
+set -eo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+cd tests/data
+
+function pkg_hash() {
+    func=$1
+    filename=$2
+    debhash=$3
+    local size=$(stat -c%s -- "$filename")
+    local dig=$(digest "$func" "$filename")
+    printf " %s %d %s\n" "$dig" $size "$filename"
+    if [[ -n "$debhash" ]]; then
+        mkdir -p "by-hash/$debhash"
+        ln -sr -- "$file" "by-hash/$debhash/$dig"
+    fi
+}
+
+function digest() {
+    local func=$1
+    local name=$2
+    local dig
+    local x
+    read dig x < <("$func"sum -- "$name")
+    printf "%s" "$dig"
+}
+
+# cleanup
+rm -rf http
+mkdir http http/deb http/repo{0,1,2,3,4}
+
+# Create some debian packages
+echo "Another bogus debian package." > http/deb/bogus-z80.deb
+echo "C++ for the ds9k arch."        > http/deb/cpp-ds9k.deb
+echo "Another dummy debian package." > http/deb/dummy-z80.deb
+echo "Another faux debian package."  > http/deb/faux-z80.deb
+echo "Another sham debian package."  > http/deb/sham-z80.deb
+
+# Generate the Packages file
+(
+    first=1
+    cd http/deb
+    for pkg in *.deb; do
+        if [[ -z "$first" ]]; then
+            echo
+        fi
+        base="${pkg%.*}"
+        name="${base%-*}"
+        arch="${base#*-}"
+        cat <<EOF
+Package: $name
+Version: 1.0
+Architecture: $arch
+Filename: deb/$pkg
+Size: $(stat -c%s -- "$pkg")
+MD5sum: $(digest md5 "$pkg")
+SHA1: $(digest sha1 "$pkg")
+SHA256: $(digest sha256 "$pkg")
+SHA512: $(digest sha512 "$pkg")
+EOF
+        first=
+    done
+) >http/repo0/Packages
+
+cd http/repo0
+
+# Compress into various formats.
+cat Packages | gzip -9 > Packages.gz
+cat Packages | bzip2 -9 > Packages.bz2
+cat Packages | xz -9 > Packages.xz
+
+# Get list of supported architectures
+archs=($(awk '/^Architecture:/{print $2}' Packages | sort -u))
+files=(Packages*)
+
+
+# Create the "good" Release and InRelease files.
+(
+    cat <<EOF
+Codename: tests
+Architectures: ${archs[@]}
+Date: $(LC_ALL=C.UTF-8 date -Ru)
+Description: flatmirror test repo
+Acquire-By-Hash: yes
+EOF
+
+    echo SHA1:
+    for file in "${files[@]}"; do
+        pkg_hash sha1 "$file" SHA1
+    done
+
+    echo SHA256:
+    for file in "${files[@]}"; do
+        pkg_hash sha256 "$file" SHA256
+    done
+
+    echo SHA512:
+    for file in "${files[@]}"; do
+        pkg_hash sha512 "$file" SHA512
+    done
+) >Release
+
+grep -vF Packages.bz2 Release | gpg --batch --yes --keyring ../../gpg/gpg.key --clearsign -o InRelease
+gpg --batch --yes --keyring ../../gpg/gpg.key --sign --armor -b -o Release.gpg Release
+
+
+# Create Release. No .gpg file, no Acquire-By-Hash.
+cd ../repo1
+ln ../repo0/Packages.xz .
+(
+    cat <<EOF
+Codename: tests
+Architectures: ${archs[@]}
+Date: $(LC_ALL=C.UTF-8 date -Ru)
+Description: another flatmirror test repo
+EOF
+
+    echo MD5Sum:
+    pkg_hash md5 Packages.xz
+
+    echo SHA256:
+    pkg_hash sha256 Packages.xz
+) >Release
+
+gpg --batch --yes --keyring ../../gpg/gpg.key --clearsign -o InRelease Release
+
+
+# Contradicting information in Release and InRelease (Acquire-By-Hash)
+cd ../repo2
+ln ../repo0/Packages* .
+ln ../repo0/Release* .
+ln ../repo1/InRelease .
+
+
+# Bad signature on Release.gpg
+cd ../repo3
+ln ../repo0/Packages* .
+ln ../repo0/InRelease .
+ln ../repo0/Release.gpg .
+ln ../repo1/Release .
+
+
+# Bad signature on InRelease
+cd ../repo4
+ln ../repo0/Packages* .
+sed 's/^Description:/\l&/' ../repo0/InRelease > InRelease

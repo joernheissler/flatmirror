@@ -153,6 +153,21 @@ def test_bad_fold() -> None:
 
 def test_parse_release_packages() -> None:
     pks = flatmirror.parse_release_file(RELEASE.splitlines())
+    assert pks.keys() == {
+        "main/binary-all/Packages",
+        "main/binary-all/Packages.gz",
+        "main/binary-all/Packages.xz",
+    }
+    assert pks["main/binary-all/Packages"].size == 22232676
+    assert pks["main/binary-all/Packages"].ext is None
+    assert pks["main/binary-all/Packages"].by_hash is True
+    assert pks["main/binary-all/Packages"].digests == {
+        "md5": bytes.fromhex("6749b4b80c6d005994c534770a684894"),
+        "sha256": bytes.fromhex(
+            "eba95496affec2ec9a4bcd71b3377882feaf922b29d1eaef07ede635941519b2"
+        ),
+    }
+    assert pks["main/binary-all/Packages.xz"].ext == "xz"
 
     with pytest.raises(ValueError):
         flatmirror.parse_release_file(CONTROL.splitlines())

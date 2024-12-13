@@ -692,7 +692,7 @@ class FileCache:
             None if file not in index or corrupted.
         """
         for hname, digest in info.digests.items():
-            if not hname in SECURE_HASH_FUNCS:
+            if hname not in SECURE_HASH_FUNCS:
                 # Don't compare digests that are not collision-resistant.
                 continue
 
@@ -723,6 +723,9 @@ class FileCache:
             )
             return None
 
+        # XXX Here we assume that the actual hashes match the index, but the file might have
+        # been corrupted on disk. Implement a flag to optionally recalculate+check the hashes.
+
         # Success! Found the correct file in the index and the storage.
 
         if not entry.url:
@@ -736,7 +739,7 @@ class FileCache:
                 return entry
             dest.unlink()
         dest.hardlink_to(cpath)
-        logging.info("Linked file")
+        logging.info(f"Linked cached file {cpath!s} to {dest!s}")
         return entry
 
     def _retrieve_from_storage(self, info: FileInfo, dest: Path) -> FileInfo | None:
@@ -791,7 +794,7 @@ class FileCache:
                 return entry
             dest.unlink()
         dest.hardlink_to(cpath)
-        logging.info("Linked file")
+        logging.info(f"Linked stored file {cpath!s} to {dest!s}")
         return entry
 
     def _retrieve_from_dest(self, info: FileInfo, dest: Path) -> FileInfo | None:
@@ -954,7 +957,7 @@ class Config:
         return cls(
             gpgkey=args.gpgkey.expanduser(),
             url=args.url,
-            path=args.path.rstrip("/"),
+            path=args.path.lstrip("/"),
             cache=args.cache.expanduser().resolve(),
             dest=args.dest.expanduser().resolve(),
             arch=set(args.arch),
@@ -1099,8 +1102,11 @@ class Fetcher:
         # Append the suffix of the url (root stripped) to the path on the file system
         dest = self.dest.joinpath(url_subpath(url, self.root_url)).resolve()
 
-        # Prevent any directory traversal
-        if not dest.is_relative_to(self.dest):
+        # Prevent any directory traversal. This is an additional
+        # safety check in case url_subpath somehow isn't sufficient.
+        if not dest.is_relative_to(
+            self.dest
+        ):  # pragma: nocover  # XXX Come up with a test case
             raise ValueError(f"File {dest!r} outside of destination {str(self.dest)!r}")
 
         # Create target directory
@@ -1199,7 +1205,7 @@ class FlatMirror:
                 self.config.path, "Release.gpg", max_size=65536
             )
         except HTTPError as ex:
-            logging.exception(ex)
+            logging.warning(ex)
         else:
             self.verifier.check_detached(release_gpg, release)
             with release.open("rt") as frd:
@@ -1208,8 +1214,7 @@ class FlatMirror:
             for filename, info in more_files.items():
                 if filename not in files:
                     files[filename] = info
-                    continue
-                if files[filename] != info:
+                elif files[filename] != info:
                     raise ValueError(filename)
 
         self.packages_files = files
@@ -1218,11 +1223,12 @@ class FlatMirror:
         """
         Fetch and process the Packages files for the repository.
 
-        This function downloads and validates the compressed Packages files
-        (e.g., Packages.gz, Packages.bz2). It decompresses these files and parses
-        their contents to extract information about available binary .deb packages,
-        which in turn are downloaded too.
+        This function downloads and validates the compressed Packages files (e.g., Packages.gz,
+        Packages.bz2). It decompresses and extracts information about available binary .deb
+        packages, which in turn are downloaded too.
         """
+        processed_packages: set[tuple[str, ...]] = set()
+
         for filename, info in self.packages_files.items():
             if not info.ext:
                 # Do not download uncompressed file.
@@ -1230,7 +1236,7 @@ class FlatMirror:
 
             if info.by_hash:
                 # If supported by the repo, download the file using their hashes.
-                # The subsequent fetch_cache will always find it in the cache.
+                # The subsequent fetch_cached will always find it in the cache.
                 for hname, hfunc in HASH_FUNCS.items():
                     if hname in info.digests:
                         # The 'Packages.xyz' part is replaced because it does not end in "/".
@@ -1241,7 +1247,6 @@ class FlatMirror:
                             filename,
                             f"by-hash/{hfunc.debian_name}/" + info.digests[hname].hex(),
                         )
-                        break
 
             filepath = self.fetcher.fetch_cached(
                 info.digests, info.size, self.config.path, filename
@@ -1254,12 +1259,17 @@ class FlatMirror:
                     decompressed_lines = bz2.open(filepath, "rt")
                 case "xz" | "lzma":
                     decompressed_lines = lzma.open(filepath, "rt")
-                case __:
-                    raise ValueError(info.ext)
+                case __:  # pragma: nocover
+                    raise AssertionError
 
             with decompressed_lines:
                 for stanza in split_stanzas(decompressed_lines):
-                    self.download_binary(stanza)
+                    key = tuple(
+                        map(stanza.get_str, ["package", "version", "architecture", "filename"])
+                    )
+                    if key not in processed_packages:
+                        processed_packages.add(key)
+                        self.download_binary(stanza)
 
     def download_binary(self, stanza: Stanza) -> None:
         """
@@ -1272,10 +1282,13 @@ class FlatMirror:
         configuration. If the package is included, it downloads the binary package
         using its filename and validates its digests.
         """
+        if stanza.get_str("architecture") not in self.config.arch:
+            return
+
         name = stanza.get_str("package")
         for pattern in self.config.exclude:
             if pattern.match(name):
-                print("Excluded:", name)
+                logging.info(f"Skipping package, excluded: {name}")
                 return
 
         if self.config.include:
@@ -1283,11 +1296,8 @@ class FlatMirror:
                 if pattern.match(name):
                     break
             else:
-                print("Not included:", name)
+                logging.info(f"Skipping package, not included: {name}")
                 return
-
-        if stanza.get_str("architecture") not in self.config.arch:
-            return
 
         digests = {
             hname: bytes.fromhex(stanza.get_str(hfunc.debian_name.lower()))
@@ -1313,6 +1323,6 @@ class FlatMirror:
             self.fetch_packages()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: nocover
     logging.basicConfig(level=logging.INFO)
     FlatMirror().run()
