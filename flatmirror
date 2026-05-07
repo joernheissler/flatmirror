@@ -1106,7 +1106,7 @@ class Fetcher:
         # safety check in case url_subpath somehow isn't sufficient.
         if not dest.is_relative_to(
             self.dest
-        ):  # pragma: nocover  # XXX Come up with a test case
+        ):
             raise ValueError(f"File {dest!r} outside of destination {str(self.dest)!r}")
 
         # Create target directory

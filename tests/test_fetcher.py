@@ -46,13 +46,15 @@ def test_resolve(fetcher: flatmirror.Fetcher) -> None:
     assert str(dest).endswith("/dest/foo/bar")
 
 
-def test_resolve_symlink_escape(fetcher: flatmirror.Fetcher) -> None:
-    outside = fetcher.dest.parent / "outside"
-    outside.mkdir()
-    (fetcher.dest / "escape").symlink_to(outside, target_is_directory=True)
-
+def test_resolve_double_slash_escape(fetcher: flatmirror.Fetcher) -> None:
+    # A malicious server can serve a Packages file containing a Filename field
+    # starting with "/files//" (where "/files/" is the repository's base URL path).
+    # urljoin treats it as an absolute-path reference, producing a URL like
+    # "mock://localhost/files//evil".  url_subpath strips the base prefix "/files/"
+    # as a plain string, yielding "/evil" which starts with "/" — so
+    # dest.joinpath("/evil") resolves to an absolute path outside the destination.
     with pytest.raises(ValueError, match="outside of destination"):
-        fetcher._resolve(("escape/", "evil"))
+        fetcher._resolve(("/files//evil",))
 
 
 def test_download(mock: MockAdapter, fetcher: flatmirror.Fetcher) -> None:
