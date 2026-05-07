@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -eo pipefail
+
+coverage erase
+coverage run -m pytest -vv --log-cli-level=INFO tests
+coverage html

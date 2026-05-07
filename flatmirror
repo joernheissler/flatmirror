@@ -1,0 +1,1328 @@
+#!/usr/bin/python3
+"""
+Mirror program for Debian's "Flat Repository Format".
+
+(c) 2023-2024 Jörn Heissler, license: GPL-3.0-or-later.
+"""
+
+import bz2
+import gzip
+import hashlib
+import logging
+import lzma
+import re
+from argparse import ArgumentParser
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
+from io import BufferedIOBase
+from os import F_TLOCK, lockf
+from pathlib import Path
+from queue import Queue
+from subprocess import PIPE, CalledProcessError, run
+from threading import Thread
+from time import monotonic as time
+from typing import Any, NamedTuple, Self
+from urllib.parse import urljoin, urlsplit
+
+import cbor2
+from requests import HTTPError, Session
+
+# Algorithm->Digests pairs. Algorithms are lower-case "md5", "sha1", "sha256" or "sha512".
+# Digests are 16, 20, 32 or 64 bytes.
+Digests = dict[str, bytes]
+
+
+class FileInfo(NamedTuple):
+    """
+    Details about downloaded/cached files
+    """
+
+    # Size of file in bytes
+    size: int
+
+    # File digests
+    digests: Digests
+
+    # URL where file was downloaded from
+    url: str
+
+    def matches(self, expected: Self) -> bool:
+        """
+        Check if the current FileInfo matches the expected FileInfo.
+        Only the expected digests are compared; additional digests in self are ignored.
+
+        Args:
+            expected: The expected FileInfo to compare with.
+
+        Returns:
+            True if matches, False otherwise.
+        """
+        result = True
+        if self.size != expected.size:
+            logging.warning(f"Size mismatch: available={self.size}, expected={expected.size}")
+            result = False
+
+        for funcname, digest in expected.digests.items():
+            self_digest = self.digests[funcname]
+            if self_digest != digest:
+                logging.warning(
+                    f"Mismatch on {funcname} digest: "
+                    f"available={self_digest.hex()}, expected={digest.hex()}"
+                )
+                result = False
+
+        return result
+
+
+class HashFunc(NamedTuple):
+    """
+    Definition of a single hash function.
+    """
+
+    # Internal name of the function
+    name: str
+
+    # Debian's name
+    debian_name: str
+
+    # Still considered collision resistant?
+    secure: bool
+
+    # Factory to create a hasher
+    func: Callable[[], Any]
+
+
+# Supported hash functions, ordered from strong to weak; name -> HashFunc
+HASH_FUNCS: dict[str, HashFunc] = {
+    "sha512": HashFunc("sha512", "SHA512", True, hashlib.sha512),
+    "sha256": HashFunc("sha256", "SHA256", True, hashlib.sha256),
+    "sha1": HashFunc("sha1", "SHA1", False, hashlib.sha1),
+    "md5": HashFunc("md5", "MD5Sum", False, hashlib.md5),
+}
+
+# Set of secure hash functions
+SECURE_HASH_FUNCS = {hfunc.name for hfunc in HASH_FUNCS.values() if hfunc.secure}
+
+
+class Hasher:
+    """
+    Iterative calculation of multiple digests in parallel.
+    """
+
+    # Total file size
+    size: int
+
+    # Computed digests
+    digests: Digests
+
+    # One queue per hash algorithm
+    _queues: list[Queue[bytes]]
+
+    def __init__(self) -> None:
+        """
+        Initialize hasher instance.
+        """
+        self.size = 0
+        self.digests = {}
+        self._queues = [Queue[bytes](maxsize=1) for __ in HASH_FUNCS]
+        for name, queue in zip(HASH_FUNCS, self._queues):
+            Thread(target=self._thread, args=(name, queue), name=name, daemon=True).start()
+
+    def _thread(self, name: str, queue: Queue[bytes]) -> None:
+        """
+        Worker thread to process the hashing.
+
+        Args:
+            name: Name of the hash function.
+            queue: Queue to pass the data to hash.
+        """
+        hasher = HASH_FUNCS[name].func()
+        while item := queue.get():
+            hasher.update(item)
+            queue.task_done()
+        self.digests[name] = hasher.digest()
+        queue.task_done()
+
+    def update(self, buf: bytes) -> None:
+        """
+        Add more bytes to the hashers.
+
+        Args:
+            buf: Bytes to hash
+        """
+        self.size += len(buf)
+
+        for queue in self._queues:
+            queue.put(buf)
+
+    def finalize(self, url: str) -> FileInfo:
+        """
+        Finalize hashers and return the digests.
+
+        Args:
+            url: URL where the file was downloaded from.
+
+        Returns:
+            A FileInfo object with complete information.
+        """
+        for queue in self._queues:
+            queue.put(b"")
+            queue.join()
+
+        return FileInfo(self.size, self.digests, url)
+
+    @classmethod
+    def hash_file(cls, path: Path, url: str) -> FileInfo:
+        """
+        Compute the digests of a file.
+
+        Args:
+            path: Path to file.
+            url: URL where the file was downloaded from.
+
+        Returns:
+            A FileInfo object with complete information.
+        """
+        self = cls()
+        with path.open("rb") as file:
+            while buf := file.read(1 << 20):
+                self.update(buf)
+        return self.finalize(url)
+
+
+class Stanza(dict[str, str | tuple[str, list[str]]]):
+    """
+    Represents a Stanza from a Debian control file.
+
+    A Stanza consists of key->value pairs. Each value can be a str
+    or (str, [str, str, ...]). The latter is used for multi-line values.
+    """
+
+    def get_str(self, key: str, default: str | None = None) -> str:
+        """
+        Ensure that val is a single-line str.
+
+        Args:
+            key: Key to lookup.
+            default: If given and key is missing, return the default.
+
+        Returns:
+            Value
+        """
+        if key not in self:
+            if default is not None:
+                return default
+            raise KeyError(key)
+
+        val = self[key]
+        if not isinstance(val, str):
+            raise ValueError(val)
+        return val
+
+    def get_multi(self, key: str) -> tuple[str, list[str]]:
+        """
+        Ensure that val is multi-line.
+
+        Args:
+            key: Key to lookup.
+
+        Returns:
+            Value
+        """
+        val = self[key]
+        if isinstance(val, str):
+            raise ValueError(val)
+        return val
+
+
+# Regular expressions to parse Debian control files.
+RE_STANZA_KEYVAL = re.compile(
+    r"""
+    ^
+    (                   # field name
+        [!"$-,.-9;-~]   # first char excludes comment, hyphen, colon.
+        [!-9;-~]*       # following chars exclude colon.
+    )
+    :                   # colon separates name from value
+    \s*                 # whitespace may surround the value
+    (.*?)               # value
+    \s*                 # whitespace may surround the value
+    $
+""",
+    re.X,
+)
+RE_STANZA_COMMENT = re.compile(r"^#")
+RE_STANZA_SEPARATOR = re.compile(r"^\s*$")
+RE_STANZA_FOLD = re.compile(r"^\s+(\S.*?)\s*$")
+
+
+def split_stanzas(lines: Iterable[str]) -> Iterator[Stanza]:
+    """
+    Parse a debian control file into a stream of Stanzas.
+
+    https://www.debian.org/doc/debian-policy/ch-controlfields.html#syntax-of-control-files
+
+    Args:
+        lines: Iterable of lines to parse
+
+    Yields:
+        Stream of Stanzas
+    """
+    cur = Stanza()
+    key: str | None = None
+
+    for lineno, line in enumerate(lines, start=1):
+        if RE_STANZA_SEPARATOR.match(line):
+            if cur:
+                yield cur
+                cur = Stanza()
+                key = None
+        elif RE_STANZA_COMMENT.match(line):
+            pass
+        elif match := RE_STANZA_FOLD.match(line):
+            if key is None:
+                raise ValueError(
+                    f"Line {lineno} begins with whitespace outside a multiline field: {line!r}"
+                )
+            cur_val = cur[key]
+            if isinstance(cur_val, str):
+                # Convert simple field into multi-line field.
+                cur[key] = cur_val, [match.group(1)]
+            else:
+                # Append line to multi-line field.
+                cur_val[1].append(match.group(1))
+        elif match := RE_STANZA_KEYVAL.match(line):
+            key = match.group(1).lower()
+            if key in cur:
+                raise ValueError(f"Duplicate key {key!r} on line {lineno}: {line!r}")
+
+            # Add new simple field
+            cur[key] = match.group(2)
+        else:
+            raise ValueError(f"Cannot parse line {lineno}: {line!r}")
+
+    if cur:
+        # At end of file, return the current Stanza.
+        yield cur
+
+
+class PackagesInfo(NamedTuple):
+    """
+    Information about a Packages file in the Debian repository.
+
+    Attributes:
+        size: Size of the Packages file in bytes.
+        ext: Compression extension of the Packages file (e.g., gz, bz2).
+        digests: Dictionary of digests for the Packages file, keyed by hash function name.
+        by_hash: Boolean indicating if the file itself and referenced .deb
+                 packages can be fetched by their hash.
+    """
+
+    size: int
+    ext: str | None
+    digests: dict[str, bytes]
+    by_hash: bool
+
+
+def parse_release_file(lines: Iterable[str]) -> dict[str, PackagesInfo]:
+    """
+    Parse the contents of a Release file to extract Packages file information.
+
+    This function parses the given lines from a Release file, extracting information
+    about the Packages files, including their location, size, compression extension, digests,
+    and whether they can be fetched by hash.
+
+    Args:
+        lines: Iterable of lines from the Release file.
+
+    Returns:
+        Dictionary mapping filenames to PackagesInfo objects, containing details about each
+        Packages file.
+    """
+    stanzas = list(split_stanzas(lines))
+    if len(stanzas) != 1:
+        raise ValueError(f"Release file contains {len(stanzas)} stanzas, expected 1")
+
+    release = stanzas[0]
+    by_hash = release.get_str("acquire-by-hash", "no") == "yes"
+    files: dict[str, PackagesInfo] = {}
+    for hfunc in HASH_FUNCS.values():
+        if hfunc.debian_name.lower() not in release:
+            continue
+
+        firstline, digests = release.get_multi(hfunc.debian_name.lower())
+        if firstline:
+            raise ValueError(firstline)
+
+        for line in digests:
+            hdigest, size, filename = line.split()
+            digest = bytes.fromhex(hdigest)
+            if not (match := re.match(r"(?:^|.*/)Packages(?:\.(xz|gz|bz2|lzma))?$", filename)):
+                continue
+            if filename not in files:
+                files[filename] = PackagesInfo(
+                    int(size), match.group(1), {hfunc.name: digest}, by_hash
+                )
+                continue
+            if files[filename].size != int(size):
+                raise ValueError(size)
+            files[filename].digests[hfunc.name] = digest
+
+    return files
+
+
+class SignatureError(Exception):
+    """
+    Bad GPG signature.
+    """
+
+
+class GpgChecker:
+    """
+    Verify GPG signatures with the "gpgv" program.
+    """
+
+    # Path to trusted GPG key
+    key: Path
+
+    def __init__(self, key: Path) -> None:
+        """
+        Initialize the GpgChecker with the path to the GPG key.
+
+        Args:
+            key: Path to the GPG key file.
+        """
+        self.key = key
+
+    def check_detached(self, signature: Path, signed: Path) -> None:
+        """
+        Check a detached GPG signature.
+
+        Args:
+            signature: Path to signature file.
+            signed: Path to signed file.
+
+        Raises:
+            Exception: Signature could not be verified for some reason.
+        """
+        args = ["gpgv", "--keyring", str(self.key), "--", str(signature), str(signed)]
+        try:
+            run(args, check=True)
+        except CalledProcessError as ex:
+            raise SignatureError(
+                f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
+            ) from ex
+
+    def check_inline(self, inline: Path) -> str:
+        """
+        Check an inline GPG signature.
+
+        Args:
+            inline: Path to signed file.
+
+        Returns:
+            Verified contents.
+
+        Raises:
+            Exception: Signature could not be verified for some reason.
+        """
+        args = ["gpgv", "--keyring", str(self.key), "-o", "-", "--", str(inline)]
+        try:
+            proc = run(args, text=True, stdout=PIPE, check=True)
+        except CalledProcessError as ex:
+            raise SignatureError(
+                f"Signature check failed: {ex.cmd} returned code {ex.returncode}"
+            ) from ex
+        return proc.stdout
+
+
+def path_inode(path: Path) -> int | None:
+    """
+    Get the inode serial number of a file.
+
+    Args:
+        path: Path to the file.
+
+    Returns:
+        Inode number or None if file is not found.
+    """
+    with suppress(FileNotFoundError):
+        return path.stat().st_ino
+    return None
+
+
+def path_copy(src: Path, dst: Path) -> None:
+    """
+    Copy a file from src to dst.
+
+    Args:
+        src: Source file path.
+        dst: Destination file path.
+    """
+    with src.open("rb") as fsrc, dst.open("wb") as fdst:
+        while buf := fsrc.read(1 << 20):
+            fdst.write(buf)
+
+
+class FileCache:
+    """
+    Efficient cache for downloaded files.
+
+    Files are referenced by their cryptographic hashsums (digests) and are hard
+    linked instead of copied.
+
+    The code handles lots of edge cases to ensure correct results while
+    avoiding re-downloading or re-hashing files.
+
+    In particular one edge-case is not handled for reasons of efficiency: If a
+    cached file is corrupted without changing its size, this won't be detected.
+    Only way around this would be to re-hash the file every time it is
+    retrieved from the cache. The cleanup function will detect those corruptions.
+    """
+
+    # Version number of the current cache format
+    CACHE_VERSION = 0
+
+    # Hash algorithm for creating cache keys
+    STORAGE_HASH = "sha256"
+
+    # Path to cache
+    _cachedir: Path
+
+    # Temporary file to create/rename links
+    _tmplink: Path
+
+    # Path to index file
+    _index_path: Path
+
+    # Current index, not set if outside context manager. The index associates
+    # the file's digests with its details and thus ensures that the file can be
+    # quickly retrieved in future requests.
+    _index: dict[str, dict[bytes, FileInfo]]
+
+    # Opened index file, not set if outside context manager
+    _index_file: BufferedIOBase
+
+    def __init__(self, cachedir: Path) -> None:
+        """
+        Initialize the FileCache.
+
+        Args:
+            cachedir: Path to cache.
+        """
+        self._cachedir = cachedir
+        self._cachedir.mkdir(exist_ok=True)
+        self._tmplink = self._cachedir / "linkfile.tmp"
+
+        self._index_path = self._cachedir / "index.cbor"
+
+        # Create empty index, if it doesn't exist yet.
+        with suppress(FileExistsError), self._index_path.open("xb") as fwr:
+            cbor2.dump((self.CACHE_VERSION, []), fwr)
+
+    def __enter__(self) -> Self:
+        """
+        Enter the context manager, lock the index file and read the index.
+
+        Returns:
+            The FileCache instance.
+        """
+        assert not hasattr(self, "_index")
+
+        index_file = self._index_path.open("r+b")
+
+        try:
+            # Lock index. Raises an Exception when already locked by other process.
+            lockf(index_file.fileno(), F_TLOCK, 0)
+
+            # Read the index
+            index: dict[str, dict[bytes, FileInfo]] = {
+                self.STORAGE_HASH: {},
+            }
+            cache_version, cache = cbor2.load(index_file)
+            if cache_version != 0:
+                raise ValueError(cache_version)
+
+            for item in cache:
+                info = FileInfo(*item)
+                for hfunc, digest in info.digests.items():
+                    if hfunc in SECURE_HASH_FUNCS:
+                        index.setdefault(hfunc, {})[digest] = info
+
+        except Exception:
+            # Close index in case of error
+            index_file.close()
+            raise
+
+        self._index = index
+        self._index_file = index_file
+
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        """
+        Write index and unlock file.
+        """
+        # The link file survives when an existing file is linked to itself. Clean it up.
+        self._tmplink.unlink(True)
+
+        # Write index to temporary file
+        tmp = self._cachedir / "index.cbor.tmp"
+        cache = list(self._index[self.STORAGE_HASH].values())
+        with tmp.open("wb") as fwr:
+            cbor2.dump((self.CACHE_VERSION, cache), fwr)
+
+        # Rename file to original path. Another process can now grab the lock.
+        tmp.rename(self._index_path)
+
+        # Unset index/index_file to mark the context manager as finished.
+        old_fp = self._index_file
+        del self._index
+        del self._index_file
+
+        # Close old index file.
+        old_fp.close()
+
+    def addfile(self, new_info: FileInfo, new_path: Path) -> None:
+        """
+        Add a file to the cache.
+
+        Args:
+            new_info: Verified file details.
+            new_path: Path to file.
+        """
+        # Create directory for file.
+        cached_path = self._cache_path(new_info)
+        cached_path.parent.mkdir(exist_ok=True)
+
+        # Link file into cache dir.
+        try:
+            cached_stat = cached_path.stat()
+        except FileNotFoundError:
+            # Hardlink new_path into cache
+            cached_path.hardlink_to(new_path)
+        else:
+            new_stat = new_path.stat()
+            if new_stat.st_ino != cached_stat.st_ino:
+                cached_info = Hasher.hash_file(cached_path, new_info.url)
+                if (
+                    cached_info.digests[self.STORAGE_HASH]
+                    != new_info.digests[self.STORAGE_HASH]
+                ):
+                    # There's a file in the cache, but it must be broken. Replace its contents.
+                    path_copy(new_path, cached_path)
+                    # The file in the cache is good to use. Remove new_path and link it.
+                    new_path.unlink()
+                    new_path.hardlink_to(cached_path)
+                elif cached_info != new_info:
+                    raise SystemError(
+                        f"Internal error or hash collision in a secure hash "
+                        f"function: {cached_info=}, {cached_path=}, "
+                        f"{new_info}, {new_path=}"
+                    )
+
+                # The file in the cache is good to use. Remove new_path and link it.
+                new_path.unlink()
+                new_path.hardlink_to(cached_path)
+            else:
+                # Downloaded file and cached file are the same. Do nothing.
+                pass
+
+        # Add file to index.
+        self._add_index(new_info)
+
+    def retrieve(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        Retrieve a file from the cache using its digests.
+
+        If the function succeeds, dest will be a hardlink to the cached file and
+        the full information is stored into the index.
+
+        Args:
+            info: Partial information about the file, typically from Release/Packages.
+            dest: Destination path.
+
+        Returns:
+            Full file details from the cache,
+            None if file not in cache or corrupted.
+        """
+
+        return (
+            self._retrieve_from_index(info, dest)
+            or self._retrieve_from_storage(info, dest)
+            or self._retrieve_from_dest(info, dest)
+        )
+
+    def cleanup(self) -> None:
+        """
+        Maintainance tasks
+
+        * Give details about everything, with varying debug level
+        * Remove all unused files from the cache.
+        * Add used files to the index.
+        * Fixup the index.
+        * Recalculate all hashes and complain on errors.
+        * Detect any hash collisons
+        """
+
+    def _cache_path(self, info: FileInfo) -> Path:
+        """
+        Compute the path to a cached file.
+
+        Args:
+            info: File details.
+
+        Returns:
+            Path to cached file.
+        """
+        digest = info.digests[self.STORAGE_HASH].hex()
+        return self._cachedir / digest[:2] / digest
+
+    def _retrieve_from_index(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        Retrieve a file from the index using its digests.
+
+        Args:
+            info: Partial information about the file.
+            dest: Destination path.
+
+        Returns:
+            Full file details from the index,
+            None if file not in index or corrupted.
+        """
+        for hname, digest in info.digests.items():
+            if hname not in SECURE_HASH_FUNCS:
+                # Don't compare digests that are not collision-resistant.
+                continue
+
+            with suppress(KeyError):
+                # Both lookups can fail.
+                entry = self._index[hname][digest]
+                break
+        else:
+            # Not found in index.
+            return None
+
+        if not entry.matches(info):
+            # Some digests don't match.
+            return None
+
+        # Desired file was found in the index. Check if the file exists and got the right size.
+        cpath = self._cache_path(entry)
+        try:
+            cstat = cpath.stat()
+        except FileNotFoundError:
+            logging.warning(f"Cached file {cpath!s} missing.")
+            return None
+
+        if cstat.st_size != entry.size:
+            logging.warning(
+                f"Size mismatch in cached file {cpath!s}: "
+                f"actual={cstat.st_size}, index={entry.size}"
+            )
+            return None
+
+        # XXX Here we assume that the actual hashes match the index, but the file might have
+        # been corrupted on disk. Implement a flag to optionally recalculate+check the hashes.
+
+        # Success! Found the correct file in the index and the storage.
+
+        if not entry.url:
+            # URL might have been forgotten after someone deleted the index.
+            entry = FileInfo(entry.size, entry.digests, info.url)
+            self._add_index(entry)
+
+        if dst_inode := path_inode(dest):
+            if dst_inode == cstat.st_ino:
+                logging.info("File already fetched")
+                return entry
+            dest.unlink()
+        dest.hardlink_to(cpath)
+        logging.info(f"Linked cached file {cpath!s} to {dest!s}")
+        return entry
+
+    def _retrieve_from_storage(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        Retrieve a file from the cache storage using its digests.
+        This is only useful if the file exists, but is missing from the index.
+
+        This function tries to find a file in the cache storage that matches the primary digest.
+        If the file is found and matches the expected digests, it is linked to the destination
+        path. If the file is missing or corrupted, the function returns None.
+
+        Args:
+            info: Information about the desired file, including its digests.
+            dest: Destination path where the file should be linked to.
+
+        Returns:
+            Full file details from the cache, or None if the file is not found or corrupted.
+        """
+        try:
+            cpath = self._cache_path(info)
+        except KeyError:
+            return None
+
+        try:
+            cstat = cpath.stat()
+        except FileNotFoundError:
+            return None
+
+        if cstat.st_size != info.size:
+            logging.warning(
+                f"Size mismatch in cached file {cpath!s}: "
+                f"actual={cstat.st_size}, expected={info.size}"
+            )
+            return None
+
+        # Found a file in the cache storage that matches the primary digest.
+        # It's missing from the index, e.g. because the index got deleted or corrupted.
+
+        entry = Hasher.hash_file(cpath, info.url)
+        if not entry.matches(info):
+            return None
+
+        # Success! Found the file in the storage, but not the index.
+
+        # Add file into index to remedy this.
+        self._add_index(entry)
+
+        # Link the file to the destination.
+        if dst_inode := path_inode(dest):
+            if dst_inode == cstat.st_ino:
+                logging.info("File already fetched")
+                return entry
+            dest.unlink()
+        dest.hardlink_to(cpath)
+        logging.info(f"Linked stored file {cpath!s} to {dest!s}")
+        return entry
+
+    def _retrieve_from_dest(self, info: FileInfo, dest: Path) -> FileInfo | None:
+        """
+        If a file was found neither in the cache index or the cache storage, check if it
+        was already downloaded, e.g. during a previous (interrupted) run of the program.
+
+        This function checks if a file at the destination path matches the expected digests.
+        If the file is missing or corrupted, the function returns None.
+        Otherwise the function links the destination file into the index or
+        vice versa, and adds it to the index.
+
+        Args:
+            info: Information about the desired file, including its digests.
+            dest: Destination path where the file is expected to be found.
+
+        Returns:
+            Full file details from the destination path, or None if the file is
+            not found or corrupted.
+        """
+        try:
+            entry = Hasher.hash_file(dest, info.url)
+        except FileNotFoundError:
+            # Desired file was not found in the destination. Give up.
+            return None
+
+        if not entry.matches(info):
+            # Found some file, but it's not what we want. Give up.
+            return None
+
+        # Success! File was already downloaded, but it's not in the index or missing in cache.
+
+        cpath = self._cache_path(entry)
+        try:
+            cstat = cpath.stat()
+        except FileNotFoundError:
+            # File is not present in the storage. Link it.
+            cpath.parent.mkdir(exist_ok=True)
+            cpath.hardlink_to(dest)
+            self._add_index(entry)
+            return entry
+
+        # Found a file in storage, but not in the index. Possibly the request did not specify
+        # the digest for the STORAGE_HASH function and the index was deleted/corrupted.
+
+        if path_inode(dest) == cstat.st_ino:
+            logging.warning("File was already in the cache but not in the index")
+            self._add_index(entry)
+            return entry
+
+        logging.warning("Found a different file in the cache.")
+        cinfo = Hasher.hash_file(cpath, info.url)
+        if not cinfo.matches(entry):
+            logging.warning("The cached file is broken. Replacing its contents.")
+            path_copy(dest, cpath)
+
+        # The file in the cache is good to use. Remove dest and link it.
+        dest.unlink()
+        dest.hardlink_to(cpath)
+
+        self._add_index(entry)
+        return entry
+
+    def _add_index(self, entry: FileInfo) -> None:
+        """
+        Add a file entry to the cache index.
+
+        Args:
+            entry: Information about the file to be added to the index.
+        """
+        for hfunc, digest in entry.digests.items():
+            if hfunc in SECURE_HASH_FUNCS:
+                self._index.setdefault(hfunc, {})[digest] = entry
+
+
+@dataclass
+class Config:
+    """
+    Config parameters for FlatMirror.
+
+    Parameters are either read from command line arguments or from a config file.
+    """
+
+    gpgkey: Path
+    url: str
+    path: str
+    cache: Path
+    dest: Path
+    arch: set[str]
+    min_speed: int
+    timeout: int | None
+    exclude: list[re.Pattern[str]]
+    include: list[re.Pattern[str]]
+
+    @classmethod
+    def from_cmdline(cls, argv: Sequence[str] | None = None) -> Self:
+        """
+        Initialize configuration parameters for FlatMirror from command line arguments.
+        """
+        parser = ArgumentParser(
+            prog="flatmirror",
+            description="Mirror program for debian flat repository format.",
+        )
+        parser.add_argument(
+            "--gpgkey",
+            required=True,
+            type=Path,
+            help="Path to gpg key that signs this repo.",
+        )
+        parser.add_argument("--url", required=True, help="URL to remote server.")
+        parser.add_argument("--path", required=True, help="Path on remote server.")
+        parser.add_argument(
+            "--cache",
+            required=True,
+            type=Path,
+            help="Path to cache directory, must be on same file system as dest.",
+        )
+        parser.add_argument(
+            "--dest", required=True, type=Path, help="Destination path to mirror into."
+        )
+        parser.add_argument(
+            "--arch",
+            required=True,
+            action="append",
+            help="Architecture(s) to mirror. Specify multiple times for multiple archs.",
+        )
+        parser.add_argument(
+            "--timeout",
+            required=False,
+            type=int,
+            default=30,
+            help="Timeout in seconds before download aborts. 0 disables timeout.",
+        )
+        parser.add_argument(
+            "--minspeed",
+            required=False,
+            type=int,
+            default=1,
+            help="Minimum speed in KiB/second. Download aborts if speed is below this.",
+        )
+        parser.add_argument(
+            "--exclude",
+            required=False,
+            action="append",
+            default=[],
+            help="Packages to exclude from mirroring (regex). "
+            "Specify multiple times for multiple exclusions.",
+        )
+        parser.add_argument(
+            "--include",
+            required=False,
+            action="append",
+            default=[],
+            help="Packages to include (regex). Specify multiple times for multiple inclusions. "
+            "By default, all packages are mirrored.",
+        )
+
+        args = parser.parse_args(argv)
+
+        return cls(
+            gpgkey=args.gpgkey.expanduser(),
+            url=args.url,
+            path=args.path.lstrip("/"),
+            cache=args.cache.expanduser().resolve(),
+            dest=args.dest.expanduser().resolve(),
+            arch=set(args.arch),
+            timeout=args.timeout or None,
+            min_speed=args.minspeed,
+            exclude=[re.compile(pattern) for pattern in args.exclude],
+            include=[re.compile(pattern) for pattern in args.include],
+        )
+
+
+def url_subpath(url: str, base: str) -> str:
+    """
+    Return sub part of url relative to base.
+
+    Args:
+        url: The full URL.
+        base: The base URL to compare against.
+
+    Returns:
+        The relative subpath of the URL.
+    """
+    s_base = urlsplit(base)
+    s_url = urlsplit(url)
+
+    # Security check to make sure the same host is accessed.
+    loc_url = s_url.scheme, s_url.netloc
+    loc_base = s_base.scheme, s_base.netloc
+
+    if loc_url != loc_base:
+        raise ValueError(f"Trying to access location {loc_url} outside host {loc_base}")
+
+    if not s_url.path.startswith(s_base.path):
+        raise ValueError(f"Trying to access path {s_url.path!r} outside root {s_base.path!r}")
+
+    return s_url.path[len(s_base.path) :]
+
+
+class Fetcher:
+    """
+    Caching HTTP downloader.
+    """
+
+    # Requests HTTP session
+    http: Session
+
+    # Archive root, e.g. https://example.net/debian/
+    root_url: str
+
+    # Local destination root
+    dest: Path
+
+    # File cache
+    cache: FileCache
+
+    # Minimum download speed in KiB/second
+    min_speed: int
+
+    # Timeout in seconds before download aborts
+    timeout: int | None
+
+    def __init__(self, config: Config, cache: FileCache) -> None:
+        """
+        Initialize the Fetcher with configuration and cache.
+
+        Args:
+            config: Configuration parameters for the fetcher.
+            cache: FileCache instance to use for caching.
+        """
+        self.http = Session()
+        self.root_url = config.url.rstrip("/") + "/"
+        self.dest = config.dest
+        self.min_speed = config.min_speed
+        self.timeout = config.timeout
+        self.cache = cache
+
+        # Ensure the destination exists.
+        self.dest.mkdir(parents=True, exist_ok=True)
+
+    def fetch_uncached(self, *paths: str, max_size: int) -> Path:
+        """
+        Fetch a file without using the cache.
+
+        Args:
+            paths: Path components to fetch.
+            max_size: Maximum size of the file to fetch.
+
+        Returns:
+            Path to the downloaded file.
+        """
+        url, dest = self._resolve(paths)
+        self._download(url, dest, max_size)
+        return dest
+
+    def fetch_cached(self, digests: Digests, size: int, *paths: str) -> Path:
+        """
+        Fetch a file using the cache.
+        The downloaded file is verified against all specified digests.
+
+        Args:
+            digests: Digests of the file to fetch.
+            size: Exact size of the file to fetch.
+            paths: Path components to fetch.
+
+        Returns:
+            Path to the downloaded file.
+        """
+        if not set(digests) & SECURE_HASH_FUNCS:
+            raise ValueError("All given digests are insecure: " + ", ".join(digests))
+
+        url, dest = self._resolve(paths)
+        expected = FileInfo(size, digests, url)
+
+        # Try to fetch the file from the cache
+        if self.cache.retrieve(expected, dest):
+            return dest
+
+        # File was not found in cache, download it.
+        info = self._download(url, dest, size)
+
+        if not info.matches(expected):
+            raise ValueError("Downloaded file failed checks.")
+
+        self.cache.addfile(info, dest)
+        return dest
+
+    def _resolve(self, paths: tuple[str, ...]) -> tuple[str, Path]:
+        """
+        Construct the URL and local path of a file to download.
+
+        Args:
+            paths: Components of the path to add to the root uri
+
+        Returns:
+            URL and local path
+        """
+
+        # Construct the URL
+        url = self.root_url
+        for path in paths:
+            url = urljoin(url, path)
+
+        # Append the suffix of the url (root stripped) to the path on the file system
+        dest = self.dest.joinpath(url_subpath(url, self.root_url)).resolve()
+
+        # Prevent any directory traversal. This is an additional
+        # safety check in case url_subpath somehow isn't sufficient.
+        if not dest.is_relative_to(
+            self.dest
+        ):  # pragma: nocover  # XXX Come up with a test case
+            raise ValueError(f"File {dest!r} outside of destination {str(self.dest)!r}")
+
+        # Create target directory
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        return url, dest
+
+    def _download(self, url: str, dest: Path, max_size: int) -> FileInfo:
+        """
+        Download a file.
+
+        Args:
+            url: File's URL
+            dest: Local destination path
+            max_size: Maximum number of bytes to download
+
+        Returns:
+            Details about downloaded file.
+        """
+        hasher = Hasher()
+        logging.info(f"Downloading file: {url=!s}, {dest=!s}, {max_size=}")
+        start_time = time()
+        speedlog_time = -10
+        with self.http.get(url, stream=True, timeout=self.timeout) as resp:
+            resp.raise_for_status()
+            first_data_time = None
+            with dest.open("wb") as fwr:
+
+                # XXX chunk_size should be None, but see https://github.com/psf/requests/issues/5536
+                for body in resp.iter_content(chunk_size=65536):
+                    if len(body) + hasher.size > max_size:
+                        raise ValueError(f"Maximum size {max_size} exceeded.")
+                    fwr.write(body)
+                    hasher.update(body)
+                    cur_time = time()
+                    if first_data_time is None:
+                        first_data_time = cur_time
+                    else:
+                        cur_speed = hasher.size / (cur_time - first_data_time) / 1024
+                        if cur_time - speedlog_time >= 5:
+                            logging.info(
+                                f"Fetched {hasher.size} bytes. Speed: {cur_speed:.1f} KiB/s"
+                            )
+                            speedlog_time = cur_time
+
+                        if cur_speed < self.min_speed:
+                            raise TimeoutError(
+                                "Below minimum speed: "
+                                f"{round(cur_speed)} KiB/s"
+                                " < "
+                                f"{self.min_speed} KiB/s"
+                            )
+
+        total_time = time() - start_time
+        logging.info(
+            f"Download finished: size={hasher.size} Bytes, time={total_time:.1f} seconds, "
+            f"speed={hasher.size / total_time / 1024:.0f} KiB/s"
+        )
+        return hasher.finalize(url)
+
+
+class FlatMirror:
+    """
+    Class to hold it all together
+    """
+
+    config: Config
+    verifier: GpgChecker
+    fetcher: Fetcher
+    packages_files: dict[str, PackagesInfo]
+
+    # File cache
+    cache: FileCache
+
+    def __init__(self, argv: Sequence[str] | None = None) -> None:
+        self.config = Config.from_cmdline(argv)
+        self.verifier = GpgChecker(self.config.gpgkey.resolve())
+        self.cache = FileCache(self.config.cache)
+        self.fetcher = Fetcher(self.config, self.cache)
+
+    def fetch_release(self) -> None:
+        """
+        Fetch, validate, and parse the required InRelease file from the repository
+        to extract information about the available index files.
+
+        If the optional Release and Release.gpg files are present, it processes them as well.
+        """
+        inrelease = self.fetcher.fetch_uncached(self.config.path, "InRelease", max_size=1048576)
+        inrelease_body = self.verifier.check_inline(inrelease)
+        files = parse_release_file(inrelease_body.splitlines())
+
+        # Try to fetch + validate the optional Release + Release.gpg files
+        try:
+            release = self.fetcher.fetch_uncached(self.config.path, "Release", max_size=1048576)
+            release_gpg = self.fetcher.fetch_uncached(
+                self.config.path, "Release.gpg", max_size=65536
+            )
+        except HTTPError as ex:
+            logging.warning(ex)
+        else:
+            self.verifier.check_detached(release_gpg, release)
+            with release.open("rt") as frd:
+                more_files = parse_release_file(frd)
+
+            for filename, info in more_files.items():
+                if filename not in files:
+                    files[filename] = info
+                elif files[filename] != info:
+                    raise ValueError(filename)
+
+        self.packages_files = files
+
+    def fetch_packages(self) -> None:
+        """
+        Fetch and process the Packages files for the repository.
+
+        This function downloads and validates the compressed Packages files (e.g., Packages.gz,
+        Packages.bz2). It decompresses and extracts information about available binary .deb
+        packages, which in turn are downloaded too.
+        """
+        processed_packages: set[tuple[str, ...]] = set()
+
+        for filename, info in self.packages_files.items():
+            if not info.ext:
+                # Do not download uncompressed file.
+                continue
+
+            if info.by_hash:
+                # If supported by the repo, download the file using their hashes.
+                # The subsequent fetch_cached will always find it in the cache.
+                for hname, hfunc in HASH_FUNCS.items():
+                    if hname in info.digests:
+                        # The 'Packages.xyz' part is replaced because it does not end in "/".
+                        self.fetcher.fetch_cached(
+                            info.digests,
+                            info.size,
+                            self.config.path,
+                            filename,
+                            f"by-hash/{hfunc.debian_name}/" + info.digests[hname].hex(),
+                        )
+
+            filepath = self.fetcher.fetch_cached(
+                info.digests, info.size, self.config.path, filename
+            )
+
+            match info.ext:
+                case "gz":
+                    decompressed_lines = gzip.open(filepath, "rt")
+                case "bz2":
+                    decompressed_lines = bz2.open(filepath, "rt")
+                case "xz" | "lzma":
+                    decompressed_lines = lzma.open(filepath, "rt")
+                case __:  # pragma: nocover
+                    raise AssertionError
+
+            with decompressed_lines:
+                for stanza in split_stanzas(decompressed_lines):
+                    key = tuple(
+                        map(stanza.get_str, ["package", "version", "architecture", "filename"])
+                    )
+                    if key not in processed_packages:
+                        processed_packages.add(key)
+                        self.download_binary(stanza)
+
+    def download_binary(self, stanza: Stanza) -> None:
+        """
+        Download a binary .deb package.
+
+        Args:
+            stanza: Stanza from the Packages file containing metadata about the package.
+
+        This function checks if the package is included or excluded based on the
+        configuration. If the package is included, it downloads the binary package
+        using its filename and validates its digests.
+        """
+        if stanza.get_str("architecture") not in self.config.arch:
+            return
+
+        name = stanza.get_str("package")
+        for pattern in self.config.exclude:
+            if pattern.match(name):
+                logging.info(f"Skipping package, excluded: {name}")
+                return
+
+        if self.config.include:
+            for pattern in self.config.include:
+                if pattern.match(name):
+                    break
+            else:
+                logging.info(f"Skipping package, not included: {name}")
+                return
+
+        digests = {
+            hname: bytes.fromhex(stanza.get_str(hfunc.debian_name.lower()))
+            for hname, hfunc in HASH_FUNCS.items()
+            if hfunc.debian_name.lower() in stanza
+        }
+
+        filename = stanza.get_str("filename")
+        file_size = int(stanza.get_str("size"))
+        self.fetcher.fetch_cached(digests, file_size, filename)
+
+    def run(self) -> None:
+        """
+        Execute the FlatMirror mirroring process.
+
+        This function orchestrates the entire mirroring process. It initializes the
+        file cache, fetches the release information, and downloads the necessary
+        packages.
+        """
+
+        with self.cache:
+            self.fetch_release()
+            self.fetch_packages()
+
+
+if __name__ == "__main__":  # pragma: nocover
+    logging.basicConfig(level=logging.INFO)
+    FlatMirror().run()

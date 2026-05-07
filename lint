@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -eo pipefail
+
+isort tests/*.py
+black tests/*.py
+mypy --strict tests/*.py
+ruff check
