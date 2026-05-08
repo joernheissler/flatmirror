@@ -45,6 +45,12 @@ def test_resolve(fetcher: flatmirror.Fetcher) -> None:
     assert url == "mock://localhost/files/foo/bar"
     assert str(dest).endswith("/dest/foo/bar")
 
+    with pytest.raises(ValueError, match="Sub part with leading slash"):
+        fetcher._resolve(("/files//evil",))
+
+    with pytest.raises(ValueError, match="Empty sub part"):
+        fetcher._resolve(("",))
+
 
 def test_download(mock: MockAdapter, fetcher: flatmirror.Fetcher) -> None:
     with mock(3, 1, 4096, 12345):
