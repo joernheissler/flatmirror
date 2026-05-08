@@ -992,7 +992,14 @@ def url_subpath(url: str, base: str) -> str:
     if not s_url.path.startswith(s_base.path):
         raise ValueError(f"Trying to access path {s_url.path!r} outside root {s_base.path!r}")
 
-    return s_url.path[len(s_base.path) :]
+    sub_part = s_url.path[len(s_base.path) :]
+    if not sub_part:
+        raise ValueError(f"Empty sub part {s_url.path!r}")
+
+    if sub_part.startswith("/"):
+        raise ValueError(f"Sub part with leading slash: {s_url.path!r}")
+
+    return sub_part
 
 
 class Fetcher:
